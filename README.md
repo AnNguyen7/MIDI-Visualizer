@@ -1,70 +1,90 @@
 # MIDI Visualizer
 
-A MIDI file visualizer built with C++/OpenGL. Drop in a MIDI file and watch the notes scroll down with particle effects and keyboard animation. No audio playback, visuals only.
+<p align="center">
+  <img src="result1.png" alt="MIDI Visualizer preview" width="700"/>
+</p>
 
-![Preview](result1.png)
+A little MIDI visualizer for piano lovers. Feed it a `.mid` file and it draws the notes falling onto a keyboard, with particles and pretty lights. Think Synthesia, but open source and a lot more customizable.
 
-## Build
+> Heads up: this is visuals only, no audio playback. Pair it with your favorite MIDI player (or just play along on a real piano).
 
-You need CMake 3.8+, a C++11 compiler, and OpenGL 3.2+. FFmpeg is optional and enables video export.
+## Build it
+
+You'll need:
+- CMake 3.8+
+- A C++11 compiler (clang on macOS, gcc on Linux, MSVC on Windows)
+- OpenGL 3.2+
+- FFmpeg (optional, only if you want video export)
+
+Then just:
 
 ```bash
 mkdir build && cmake -S . -B build && cmake --build build
 ```
 
-The app will be at `build/MIDIVisualizer.app` (macOS) or `build/MIDIVisualizer` (Linux/Windows).
+You'll get `build/MIDIVisualizer.app` on macOS, or `build/MIDIVisualizer` on Linux/Windows.
 
-**Linux only** -> install these first:
+**On Linux**, install these first:
 ```
 xorg-dev libgtk-3-dev libnotify libasound2-dev
 ```
-For video export add: `libavcodec-dev libavformat-dev libavdevice-dev`
+And for video export: `libavcodec-dev libavformat-dev libavdevice-dev`
 
-## Run
+## Run it
 
-On macOS, just double-click the app or run it from the terminal:
+Easiest way on macOS:
 
 ```bash
 open build/MIDIVisualizer.app
 ```
 
-A file picker opens on startup. Pick a `.mid` file and you're good to go.
+A file picker pops up -> grab any `.mid` file. Try one of your favorite pieces. Personally I like dropping in some Ghibli soundtracks (Howl's Moving Castle, Spirited Away) and watching them play out.
 
-You can also pass a file directly:
+Want to skip the file picker? Pass it directly:
 
 ```bash
-./MIDIVisualizer --midi path/to/file.mid
+./MIDIVisualizer --midi path/to/song.mid
 ```
 
-## Keyboard shortcuts
+## Controls
 
 - `p` -> play / pause
-- `r` -> restart from beginning
-- `i` -> show / hide settings panel
+- `r` -> restart
+- `i` -> toggle the settings panel
 
-## CLI options
+Inside the settings panel you can mess with colors, particles, the background, keyboard style, basically everything you see on screen.
+
+## CLI flags
+
+The basics:
 
 ```
 --midi <path>        MIDI file to load
---device <name>      Live MIDI input device (use VIRTUAL for a virtual device)
---config <path>      Load settings from an INI file
+--device <name>      Live MIDI input (use VIRTUAL for a virtual device)
+--config <path>      Load a settings .ini
 --size <W> <H>       Window size
 --fullscreen <0|1>   Start fullscreen
 --quality <level>    LOW_RES / LOW / MEDIUM / HIGH / HIGH_RES
---help               Show all available options
+--help               Full option list
 ```
 
-**Export options:**
+Export to video or PNG frames:
 
 ```
---export <path>      Output path for video or PNG frames
+--export <path>      Output file or folder
 --format <fmt>       PNG / MPEG2 / MPEG4 / PRORES
---framerate <n>      Frames per second
---hide-window <0|1>  Run headless during export
+--framerate <n>      FPS
+--hide-window <0|1>  Run headless
 ```
 
-Example -> export a 1080p video without showing the window:
+Example -> render your song to a 1080p MP4 in the background:
 
 ```bash
 ./MIDIVisualizer --midi song.mid --size 1920 1080 --export out.mp4 --format MPEG4 --hide-window 1
 ```
+
+## Notes
+
+- Background images you drop in via the settings panel are loaded at runtime, no rebuild needed.
+- If you change anything in `resources/` (shaders, fonts, textures), rebuild so the `Packaging` target re-bakes them into the binary.
+- The original project is by [@kosua20](https://github.com/kosua20). This is my fork where I'm tinkering with visuals.

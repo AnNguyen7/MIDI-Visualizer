@@ -15,3 +15,7 @@ x64/
 */xcuserdata/*
 dependencies/
 libs/ffmpeg
+
+# Personal background images / wallpapers (not part of the app)
+1137731.jpg
+backgrounds/
