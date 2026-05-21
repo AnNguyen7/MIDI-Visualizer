@@ -170,18 +170,37 @@ Arguments Configuration::parseArguments(std::istream & configFile){
 		}
 		std::vector<std::string> values;
 		const std::string key = trim(lineTrim.substr(0, keySep), "-: \t");
-		// Split the rest of the line based on spaces only.
-		std::string::size_type beginPos = keySep + 1;
-		std::string::size_type afterEndPos = lineTrim.find_first_of(" \t", beginPos);
-		while(afterEndPos != std::string::npos) {
-			const std::string value = lineTrim.substr(beginPos, afterEndPos - beginPos);
-			values.push_back(value);
-			beginPos	= afterEndPos + 1;
-			afterEndPos = lineTrim.find_first_of(" \t", beginPos);
+		// Split the rest of the line on spaces, but keep "quoted strings" together
+		// so that paths containing spaces survive a save/load cycle.
+		std::string::size_type pos = keySep + 1;
+		while(pos < lineTrim.size()) {
+			// Skip leading whitespace between tokens.
+			while(pos < lineTrim.size() && (lineTrim[pos] == ' ' || lineTrim[pos] == '\t')){
+				++pos;
+			}
+			if(pos >= lineTrim.size()){
+				break;
+			}
+			if(lineTrim[pos] == '"'){
+				// Quoted token: read until the matching closing quote.
+				const std::string::size_type endQuote = lineTrim.find('"', pos + 1);
+				if(endQuote == std::string::npos){
+					// Unterminated quote: take the rest of the line as-is.
+					values.push_back(lineTrim.substr(pos + 1));
+					break;
+				}
+				values.push_back(lineTrim.substr(pos + 1, endQuote - pos - 1));
+				pos = endQuote + 1;
+			} else {
+				const std::string::size_type endTok = lineTrim.find_first_of(" \t", pos);
+				if(endTok == std::string::npos){
+					values.push_back(lineTrim.substr(pos));
+					break;
+				}
+				values.push_back(lineTrim.substr(pos, endTok - pos));
+				pos = endTok;
+			}
 		}
-		// There is one remaining value, the last one.
-		const std::string value = lineTrim.substr(beginPos);
-		values.push_back(value);
 
 		if(!key.empty() && !values.empty()) {
 			args[key] = values;

@@ -566,7 +566,13 @@ void State::save(const std::string & path){
 		configFile << infos.values << ")" << std::endl;
 		configFile << param.first << ":";
 		for(const std::string& str : *(param.second)){
-			configFile << " " << str;
+			// Quote paths that contain whitespace so they survive parsing.
+			const bool needsQuotes = str.find_first_of(" \t") != std::string::npos;
+			if(needsQuotes){
+				configFile << " \"" << str << "\"";
+			} else {
+				configFile << " " << str;
+			}
 		}
 		configFile << std::endl;
 	}
