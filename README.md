@@ -1,7 +1,7 @@
 # MIDI Visualizer
 
 <p align="center">
-  <img src="result1.png" alt="MIDI Visualizer preview" width="700"/>
+  <img src="docs/result1.png" alt="MIDI Visualizer preview" width="700"/>
 </p>
 
 A little MIDI visualizer for piano lovers. Feed it a `.mid` file and it draws the notes falling onto a keyboard, with particles and pretty lights. Think Synthesia, but open source and a lot more customizable.
@@ -60,9 +60,17 @@ Run a sound engine (Pianoteq 9 used as the example, anything that takes MIDI inp
 
 ### macOS
 
-1. Open `Audio MIDI Setup` -> `Window` -> `Show MIDI Studio` -> double-click **IAC Driver** -> tick **"Device is online"**.
-2. In Pianoteq -> `Options` -> `Devices` -> **MIDI Input** -> enable `IAC Driver Bus 1`.
-3. In MIDIVisualizer -> press `i` -> expand **Playback** -> pick `IAC Driver Bus 1` from the **MIDI output** dropdown.
+**1.** Open `Audio MIDI Setup` -> `Window` -> `Show MIDI Studio` -> double-click **IAC Driver** -> tick **"Device is online"**.
+
+<img src="docs/step1.png" alt="IAC Driver online" width="480"/>
+
+**2.** In Pianoteq -> `Options` -> `Devices` -> **MIDI Input** -> enable `IAC Driver Bus 1`.
+
+<img src="docs/step2.png" alt="Pianoteq MIDI input" width="480"/>
+
+**3.** In MIDIVisualizer -> press `i` -> expand **Playback** -> pick `IAC Driver Bus 1` from the **MIDI output** dropdown.
+
+<img src="docs/step3.png" alt="MIDIVisualizer MIDI output dropdown" width="480"/>
 
 ### Windows
 
