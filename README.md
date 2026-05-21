@@ -6,7 +6,7 @@
 
 A little MIDI visualizer for piano lovers. Feed it a `.mid` file and it draws the notes falling onto a keyboard, with particles and pretty lights. Think Synthesia, but open source and a lot more customizable.
 
-> Heads up: this is visuals only, no audio playback. Pair it with your favorite MIDI player (or just play along on a real piano).
+> No built-in sound. The app can stream MIDI to any piano VST (Pianoteq, Garritan, Keyscape, etc.) over a virtual MIDI port. Setup below.
 
 ## Build it
 
@@ -53,6 +53,26 @@ Want to skip the file picker? Pass it directly:
 - `i` -> toggle the settings panel
 
 Inside the settings panel you can mess with colors, particles, the background, keyboard style, basically everything you see on screen.
+
+## Synced audio (Pianoteq or any piano VST)
+
+Run a sound engine (Pianoteq 9 used as the example, anything that takes MIDI input works) alongside the visualizer and route notes to it through a virtual MIDI cable. One-time setup, then it's automatic.
+
+### macOS
+
+1. Open `Audio MIDI Setup` -> `Window` -> `Show MIDI Studio` -> double-click **IAC Driver** -> tick **"Device is online"**.
+2. In Pianoteq -> `Options` -> `Devices` -> **MIDI Input** -> enable `IAC Driver Bus 1`.
+3. In MIDIVisualizer -> press `i` -> expand **Playback** -> pick `IAC Driver Bus 1` from the **MIDI output** dropdown.
+
+### Windows
+
+Windows has no built-in virtual MIDI port, so install **loopMIDI** (free, by Tobias Erichsen) once.
+
+1. Install [loopMIDI](https://www.tobias-erichsen.de/software/loopmidi.html), open it, click `+` to create a port named `loopMIDI Port`.
+2. In Pianoteq -> `Options` -> `Devices` -> **MIDI Input** -> enable `loopMIDI Port`.
+3. In MIDIVisualizer -> press `i` -> expand **Playback** -> pick `loopMIDI Port` from the **MIDI output** dropdown.
+
+After that: just open Pianoteq (it can be minimized), load your `.mid` in MIDIVisualizer, press `p`. Visuals + audio in sync, one play button.
 
 ## CLI flags
 

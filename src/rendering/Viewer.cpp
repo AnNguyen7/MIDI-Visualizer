@@ -555,6 +555,39 @@ SystemAction Viewer::drawGUI(const float currentTime) {
 				ImGui::helpTooltip(s_scroll_reverse_dsc);
 			}
 
+			// MIDI output: send playback events to a virtual port so an external
+			// sound engine (e.g. Pianoteq via the macOS IAC Driver) can play in sync.
+			if(!_liveplay){
+				auto fileScene = std::dynamic_pointer_cast<MIDISceneFile>(_scene);
+				if(fileScene){
+					ImGui::Separator();
+					ImGui::TextUnformatted("MIDI output (drives external piano VSTs):");
+					const std::string currentName = fileScene->midiOutputPortName();
+					const char * previewLabel = currentName.empty() ? "Disabled" : currentName.c_str();
+					ImGuiPushItemWidth(260);
+					if(ImGui::BeginCombo("##midi_out_combo", previewLabel)){
+						// Use cached list - the Refresh button forces a re-scan.
+						const auto & ports = MIDISceneFile::availableOutputPorts(false);
+						if(ImGui::Selectable("Disabled", currentName.empty())){
+							fileScene->setMidiOutputByName("");
+						}
+						for(const auto & name : ports){
+							const bool sel = (name == currentName);
+							if(ImGui::Selectable(name.c_str(), sel)){
+								fileScene->setMidiOutputByName(name);
+							}
+						}
+						ImGui::EndCombo();
+					}
+					ImGui::PopItemWidth();
+					ImGuiSameLine();
+					if(ImGui::SmallButton("Refresh##midi_out")){
+						MIDISceneFile::availableOutputPorts(true);
+					}
+					ImGui::helpTooltip("Send note on/off events to an external app. On macOS, enable IAC Driver in Audio MIDI Setup, then select it here.");
+				}
+			}
+
 		}
 
 		if(ImGui::CollapsingHeader("Notes##HEADER")){
@@ -694,6 +727,9 @@ SystemAction Viewer::showTopButtons(double currentTime){
 	if (ImGui::Button(_shouldPlay ? "Pause (p)" : "Play (p)")) {
 		_shouldPlay = !_shouldPlay;
 		_timerStart = float(currentTime) - _timer;
+		if(!_shouldPlay){
+			if(auto fs = std::dynamic_pointer_cast<MIDISceneFile>(_scene)) fs->silenceAllNotes();
+		}
 	}
 	ImGuiSameLine();
 	if (ImGui::Button("Restart (r)")) {
@@ -2188,6 +2224,9 @@ void Viewer::keyPressed(int key, int action) {
 		if (key == GLFW_KEY_P) {
 			_shouldPlay = !_shouldPlay;
 			_timerStart = DEBUG_SPEED * float(glfwGetTime()) - _timer;
+			if(!_shouldPlay){
+				if(auto fs = std::dynamic_pointer_cast<MIDISceneFile>(_scene)) fs->silenceAllNotes();
+			}
 		}
 		else if (key == GLFW_KEY_R) {
 			reset();
@@ -2208,6 +2247,7 @@ void Viewer::reset() {
 	_timer = -_state.prerollTime;
 	_timerStart = DEBUG_SPEED * float(glfwGetTime()) + (_shouldPlay ? _state.prerollTime : 0.0f);
 	_scene->resetParticles();
+	if(auto fs = std::dynamic_pointer_cast<MIDISceneFile>(_scene)) fs->silenceAllNotes();
 }
 
 void Viewer::setState(const State & state){
