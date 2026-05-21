@@ -88,6 +88,7 @@ bool MIDISceneFile::setMidiOutputByName(const std::string & portName){
 void MIDISceneFile::silenceAllNotes(){
 	if(!_midiOut || !_midiOut->is_port_open()){
 		_wasActive.fill(false);
+		_lastPedalCC = {-1, -1, -1, -1};
 		return;
 	}
 	// CC 123 (All Notes Off) on every channel, plus explicit note-offs we know are active.
@@ -101,7 +102,14 @@ void MIDISceneFile::silenceAllNotes(){
 		unsigned char allOff[3] = {(unsigned char)(0xB0 | ch), 123, 0};
 		_midiOut->send_message(allOff, 3);
 	}
+	// Release all pedals on channel 0 (damper, sostenuto, soft, expression).
+	const unsigned char ccNums[4] = {64, 66, 67, 11};
+	for(int p = 0; p < 4; ++p){
+		unsigned char msg[3] = {0xB0, ccNums[p], 0};
+		_midiOut->send_message(msg, 3);
+	}
 	_wasActive.fill(false);
+	_lastPedalCC = {-1, -1, -1, -1};
 }
 
 MIDISceneFile::MIDISceneFile(const std::string & midiFilePath, const SetOptions & options, const FilterOptions& filter) : MIDIScene() {
@@ -229,6 +237,24 @@ void MIDISceneFile::updatesActiveNotes(double time, double speed, const FilterOp
 	// Update pedal state.
 	_pedals.damper = _pedals.sostenuto = _pedals.soft = _pedals.expression = 0.0f;
 	_midiFile.getPedalsActive(_pedals.damper, _pedals.sostenuto, _pedals.soft, _pedals.expression, time, 0);
+
+	// Forward pedal changes as Control Change messages so VSTs respond to sustain/sostenuto/soft.
+	if(_midiOut && _midiOut->is_port_open()){
+		const float vals[4] = {_pedals.damper, _pedals.sostenuto, _pedals.soft, _pedals.expression};
+		const unsigned char ccNums[4] = {64, 66, 67, 11};
+		try {
+			for(int p = 0; p < 4; ++p){
+				int cc = int(glm::clamp(vals[p], 0.0f, 1.0f) * 127.0f + 0.5f);
+				if(cc != _lastPedalCC[p]){
+					unsigned char msg[3] = {0xB0, ccNums[p], (unsigned char)cc};
+					_midiOut->send_message(msg, 3);
+					_lastPedalCC[p] = cc;
+				}
+			}
+		} catch(const std::exception & e){
+			std::cerr << "[MIDI]: pedal CC failed: " << e.what() << std::endl;
+		}
+	}
 }
 
 double MIDISceneFile::duration() const {

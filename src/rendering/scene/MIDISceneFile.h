@@ -52,6 +52,7 @@ private:
 
 	std::unique_ptr<libremidi::midi_out> _midiOut;
 	std::array<bool, 128> _wasActive{};
+	std::array<int, 4> _lastPedalCC{{-1, -1, -1, -1}}; // damper, sostenuto, soft, expression
 	std::string _midiOutPortName; // empty when disabled
 
 	static std::vector<std::string> _availableOutputPorts;
