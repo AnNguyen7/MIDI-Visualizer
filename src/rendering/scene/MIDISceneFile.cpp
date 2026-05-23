@@ -207,15 +207,28 @@ void MIDISceneFile::updatesActiveNotes(double time, double speed, const FilterOp
 			}
 		}
 	}
-	_previousTime = time;
-
 	// Send MIDI output messages for note transitions (drives Pianoteq or any external sound engine).
+	// IMPORTANT: must read _previousTime BEFORE it gets updated below, so the onset check
+	// can compare note.start against the previous frame's time.
 	if(_midiOut && _midiOut->is_port_open()){
 		try {
 			for(int i = 0; i < 128; ++i){
-				const bool nowActive = actives[i].enabled;
+				const auto & note = actives[i];
+				const bool nowActive = note.enabled;
+				// Detect a fresh onset, so repeated notes on the same pitch retrigger correctly.
+				const bool justStarted = nowActive
+					&& (double(note.start) > _previousTime)
+					&& (double(note.start) <= time);
+
+				// Repeated note: end the previous instance before striking the new one.
+				if(justStarted && _wasActive[i]){
+					unsigned char off[3] = {0x80, (unsigned char)i, 0};
+					_midiOut->send_message(off, 3);
+					_wasActive[i] = false;
+				}
+
 				if(nowActive && !_wasActive[i]){
-					int vel = int(actives[i].velocity);
+					int vel = int(note.velocity);
 					if(vel < 1) vel = 80; // some files mark velocity 0 as note-off; safe default
 					if(vel > 127) vel = 127;
 					unsigned char on[3] = {0x90, (unsigned char)i, (unsigned char)vel};
@@ -233,6 +246,8 @@ void MIDISceneFile::updatesActiveNotes(double time, double speed, const FilterOp
 			_wasActive.fill(false);
 		}
 	}
+
+	_previousTime = time;
 
 	// Update pedal state.
 	_pedals.damper = _pedals.sostenuto = _pedals.soft = _pedals.expression = 0.0f;
