@@ -281,11 +281,17 @@ int main( int argc, char** argv) {
 		}
 		// Apply custom state.
 		State state;
-		if(!config.lastConfigPath.empty()){
-			state.load(config.lastConfigPath);
+		try {
+			if(!config.lastConfigPath.empty()){
+				state.load(config.lastConfigPath);
+			}
+			// Apply any extra display argument on top of the existing config.
+			state.load(config.args());
+		} catch(const std::exception & e){
+			// Never let a broken settings file prevent the app from starting.
+			std::cerr << "[CONFIG]: Unable to load settings (" << e.what() << "), using defaults." << std::endl;
+			state = State();
 		}
-		// Apply any extra display argument on top of the existing config.
-		state.load(config.args());
 		viewer.setState(state);
 
 		// Connect to MIDI device if specified. We do it after setting the state because there are constraints on the scroll direction when recording.

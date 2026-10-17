@@ -342,12 +342,24 @@ bool Configuration::parseBool(const std::string & str){
 	return str == "1" || str == "true" || str == "yes" || str == "True" || str == "Yes";
 }
 
+// An unreadable value is ignored rather than thrown: a single bad entry in a saved
+// settings file would otherwise abort the app on every launch.
 int Configuration::parseInt(const std::string & str){
-	return std::stoi(str);
+	try {
+		return std::stoi(str);
+	} catch(const std::exception &){
+		std::cerr << "[CONFIG]: Ignoring invalid value \"" << str << "\"." << std::endl;
+		return 0;
+	}
 }
 
 float Configuration::parseFloat(const std::string & str){
-	return std::stof(str);
+	try {
+		return std::stof(str);
+	} catch(const std::exception &){
+		std::cerr << "[CONFIG]: Ignoring invalid value \"" << str << "\"." << std::endl;
+		return 0.0f;
+	}
 }
 
 glm::vec3 Configuration::parseVec3(const std::vector<std::string> & strs){

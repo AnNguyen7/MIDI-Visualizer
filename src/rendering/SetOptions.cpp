@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <glm/glm.hpp>
+#include <iostream>
 #include <sstream>
+#include <stdexcept>
 
 SetOptions::SetOptions(){
 	rebuild();
@@ -121,12 +123,19 @@ void SetOptions::fromKeysString(const std::string& str){
 		if(values.size() < 2){
 			continue;
 		}
-		KeyFrame& newKey = keys.emplace_back();
-		newKey.time = std::stod(values[0]);
-		newKey.key = std::stoi(values[1]);
-		if(values.size() > 2){
-			newKey.set = std::stoi(values[2]);
+		KeyFrame newKey;
+		try {
+			newKey.time = std::stod(values[0]);
+			newKey.key = std::stoi(values[1]);
+			if(values.size() > 2){
+				newKey.set = std::stoi(values[2]);
+			}
+		} catch(const std::exception &){
+			// Skip an unreadable control point instead of aborting the settings load.
+			std::cerr << "[CONFIG]: Ignoring invalid control point \"" << tokens[i] << "\"." << std::endl;
+			continue;
 		}
+		keys.push_back(newKey);
 	}
 	
 	rebuild();
