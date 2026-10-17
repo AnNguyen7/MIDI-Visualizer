@@ -21,7 +21,6 @@ public:
 
 	void setScaleAndMinorWidth(const float scale, const float minorWidth);
 
-	void setParticlesParameters(const float speed, const float expansion);
 
 	void setKeyboardSizeAndFadeout(float keyboardHeight, float fadeOut);
 
@@ -36,7 +35,7 @@ public:
 	
 	void drawFlashes(const std::shared_ptr<MIDIScene>& scene, float time, const glm::vec2 & invScreenSize, const State::FlashesState& state);
 	
-	void drawParticles(const std::shared_ptr<MIDIScene>& scene, float time, const glm::vec2 & invScreenSize, const State::ParticlesState & state, bool prepass);
+	void drawParticles(const std::shared_ptr<MIDIScene>& scene, float time, const glm::vec2 & invScreenSize, const State::ParticlesState & state, float pixelScale, bool prepass);
 	
 	void drawKeyboard(const std::shared_ptr<MIDIScene>& scene, float time, const glm::vec2 & invScreenSize, const glm::vec3 & edgeColor, const glm::vec3 & keyColor, const ColorArray & majorColors, const ColorArray & minorColors, bool highlightKeys);
 
@@ -76,7 +75,6 @@ private:
 	GLuint _vaoWave;
 	size_t _wavePrimitiveCount;
 
-	GLuint _texParticles;
 	GLuint _texFont;
 	GLuint _texNoise;
 

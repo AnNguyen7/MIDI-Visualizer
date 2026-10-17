@@ -43,6 +43,7 @@ public:
 	bool setMidiOutputByName(const std::string & portName); // empty string disables
 	const std::string& midiOutputPortName() const { return _midiOutPortName; }
 	void silenceAllNotes(); // sends note-off + all-notes-off, call on pause/restart
+	void setOutputActive(bool active); // nothing is sent while inactive (paused, exporting)
 
 private:
 
@@ -54,6 +55,7 @@ private:
 	std::array<bool, 128> _wasActive{};
 	std::array<int, 4> _lastPedalCC{{-1, -1, -1, -1}}; // damper, sostenuto, soft, expression
 	std::string _midiOutPortName; // empty when disabled
+	bool _outputActive = false; // playback is running, events can be sent
 
 	static std::vector<std::string> _availableOutputPorts;
 };

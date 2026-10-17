@@ -262,11 +262,18 @@ int main( int argc, char** argv) {
 		// Setup ImGui for interface.
 		ImGui::CreateContext();
 
-		ImGui::configureFont(font);
+		// Rasterize the font at the density of the display (framebuffer pixels per window unit)
+		// and at the saved GUI scale, so that the text stays sharp.
+		int fontWinW, fontWinH, fontFbW, fontFbH;
+		glfwGetWindowSize(window, &fontWinW, &fontWinH);
+		glfwGetFramebufferSize(window, &fontFbW, &fontFbH);
+		const float displayDensity = float(fontFbW) / float((std::max)(fontWinW, 1));
+		ImGui::configureFont(font, displayDensity * (std::max)(1.0f, config.guiScale));
 		ImGui::configureStyle();
 		
 		ImGui_ImplGlfw_InitForOpenGL(window, false);
 		ImGui_ImplOpenGL3_Init("#version 330");
+		ImGui::createPaperTexture();
 
 		// Load midi file if specified.
 		if(!config.lastMidiPath.empty()){
@@ -324,12 +331,26 @@ int main( int argc, char** argv) {
 
 		// Start the display/interaction loop.
 		while (!glfwWindowShouldClose(window)) {
+			// Keep the text sharp when the interface is rescaled (or moved to another display):
+			// rasterize the font again at the new size, once the rescaling is done.
+			{
+				glfwGetWindowSize(window, &fontWinW, &fontWinH);
+				glfwGetFramebufferSize(window, &fontFbW, &fontFbH);
+				const float fontScale = float(fontFbW) / float((std::max)(fontWinW, 1)) * (std::max)(1.0f, viewer.guiScale());
+				if(fontWinW > 0 && fontFbW > 0 && !viewer.isResizingPanel() && ImGui::fontNeedsRebuild(fontScale)){
+					ImGui_ImplOpenGL3_DestroyFontsTexture();
+					ImGui::configureFont(font, fontScale);
+					ImGui_ImplOpenGL3_CreateFontsTexture();
+					viewer.setGUIScale(viewer.guiScale());
+				}
+			}
+
 			ImGui_ImplOpenGL3_NewFrame();
 			ImGui_ImplGlfw_NewFrame();
 			ImGui::NewFrame();
 
 			// Update the content of the window.
-			SystemAction action = viewer.draw(DEBUG_SPEED * float(glfwGetTime()));
+			SystemAction action = viewer.draw(DEBUG_SPEED * glfwGetTime());
 
 			// Perform system window action if required.
 			performAction(action, window, frame);

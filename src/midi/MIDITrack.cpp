@@ -186,12 +186,20 @@ void MIDITrack::extractNotes(const std::vector<MIDITempo> & tempos, uint16_t uni
 	}
 }
 
-void MIDITrack::getNotes(std::vector<MIDINote> & notes, NoteType type, const FilterOptions& filter ) const {
+void MIDITrack::getNotes(std::vector<MIDINote> & notes, NoteType type, const FilterOptions& filter, int transpose ) const {
 	notes.clear();
 	notes.reserve( _notes.size() );
 	for(auto& note : _notes){
-		const bool isMin = noteIsMinor[note.note % 12];
-		const short shiftId = (note.note/12) * 7 + noteShift[note.note % 12];
+		// Visual transpose: shift the pitch used for screen placement (white/black
+		// classification and horizontal position) only. The note's own pitch is left
+		// untouched so audio/export stay at original pitch. Notes shifted off the
+		// 0-127 range are not drawn rather than piling up on the edge key.
+		const int p = int(note.note) + transpose;
+		if(p < 0 || p > 127){
+			continue;
+		}
+		const bool isMin = noteIsMinor[p % 12];
+		const short shiftId = (p/12) * 7 + noteShift[p % 12];
 		if(type == NoteType::ALL || (type == NoteType::MINOR && isMin) || (type == NoteType::MAJOR && !isMin)){
 			if( !filter.accepts( note.track, note.channel ) )
 				continue;

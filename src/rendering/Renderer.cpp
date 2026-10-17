@@ -2,6 +2,7 @@
 #include <iostream>
 #include <vector>
 #include <algorithm>
+#include <cmath>
 #include <glm/gtc/matrix_transform.hpp>
 
 #include "../helpers/ResourcesManager.h"
@@ -164,11 +165,6 @@ void Renderer::renderSetup(){
 	// Pass texture size to shader.
 	_texFont = ResourcesManager::getTextureFor("font");
 	_texNoise = ResourcesManager::getTextureFor("noise");
-	_texParticles = ResourcesManager::getTextureFor("particles");
-	const glm::vec2 tsize = ResourcesManager::getTextureSizeFor("particles");
-	_programParticules.use();
-	_programParticules.uniform("inverseTextureSize", 1.0f / tsize);
-	glUseProgram(0);
 
 }
 
@@ -207,13 +203,6 @@ void Renderer::setScaleAndMinorWidth(const float scale, const float minorWidth){
 	_programNotes.uniform("minorsWidth", minorWidth);
 	_programKeyMinors.use();
 	_programKeyMinors.uniform("minorsWidth", minorWidth);
-	glUseProgram(0);
-}
-
-void Renderer::setParticlesParameters(const float speed, const float expansion){
-	_programParticules.use();
-	_programParticules.uniform("speedScaling", speed);
-	_programParticules.uniform("expansionFactor", expansion);
 	glUseProgram(0);
 }
 
@@ -285,13 +274,14 @@ void Renderer::setOrientation(bool horizontal){
 	glUseProgram(0);
 }
 
-void Renderer::drawParticles(const std::shared_ptr<MIDIScene>& scene, float time, const glm::vec2 & invScreenSize, const State::ParticlesState & state, bool prepass){
+void Renderer::drawParticles(const std::shared_ptr<MIDIScene>& scene, float time, const glm::vec2 & invScreenSize, const State::ParticlesState & state, float pixelScale, bool prepass){
 
 	glEnable(GL_BLEND);
 	_programParticules.use();
 	
 	// Common uniforms values.
 	_programParticules.uniform("inverseScreenSize", invScreenSize);
+	_programParticules.uniform("pixelScale", pixelScale);
 	_programParticules.uniform("time", 0.0f);
 
 	// Prepass : bigger, darker particles.
@@ -300,13 +290,12 @@ void Renderer::drawParticles(const std::shared_ptr<MIDIScene>& scene, float time
 
 	_programParticules.uniforms("baseColor", state.colors.size(), state.colors.data());
 	
-	// Particles trajectories texture.
-	_programParticules.texture("textureParticles", _texParticles, GL_TEXTURE_2D);
-	_programParticules.texture("textureNoise", _texNoise, GL_TEXTURE_2D);
 	_programParticules.texture("lookParticles", state.tex, GL_TEXTURE_2D_ARRAY);
-	_programParticules.uniform("turbulenceStrength", state.turbulenceStrength);
-	_programParticules.uniform("turbulenceScale", state.turbulenceScale);
+	_programParticules.uniform("useImages", !state.imagePaths.empty());
 	_programParticules.uniform("texCount", state.texCount);
+	// Floating controls (updated every frame so the settings sliders take effect live).
+	_programParticules.uniform("floatHeight", state.floatHeight);
+	_programParticules.uniform("sway", state.sway);
 
 	// Select the geometry.
 	glBindVertexArray(_vaoQuad);
@@ -317,6 +306,8 @@ void Renderer::drawParticles(const std::shared_ptr<MIDIScene>& scene, float time
 			_programParticules.uniform("time", particle.elapsed);
 			_programParticules.uniform("duration", particle.duration);
 			_programParticules.uniform("channel", particle.set);
+			// Each note gets its own pattern, kept small for the shader random generator.
+			_programParticules.uniform("seed", std::fmod(particle.start * 12.345f, 100.0f));
 			glDrawElementsInstanced(GL_TRIANGLES, int(_quadPrimitiveCount), GL_UNSIGNED_INT, (void*)0, state.count);
 		}
 	}

@@ -19,6 +19,17 @@
 #endif
 
 #define MAX_NOTES_IN_FLIGHT 8192
+// A live note recording longer than this (seconds) is treated as stuck (its
+// note-off was lost) and force-closed. Real piano notes never sustain this long.
+#define STUCK_NOTE_TIMEOUT 30.0
+// A frame longer than this (seconds) means the render loop stalled (app
+// backgrounded / AFK), not real playback. Used to auto-close recording notes so
+// they don't stretch their duration across the whole idle gap.
+#define LIVE_STALL_GAP 0.5
+// Upper bounds to keep memory from growing without limit during a very long
+// live session (these only trim ancient history, never anything still on screen).
+#define MAX_STORED_FRAMES 500000
+#define MAX_STORED_PEDAL_EVENTS 8192
 
 MIDISceneLive::~MIDISceneLive(){
 	shared().close_port();
@@ -42,11 +53,13 @@ MIDISceneLive::MIDISceneLive(int port, bool verbose) : MIDIScene() {
 
 	_activeIds.fill(-1);
 	_activeRecording.fill(false);
+	_rawToDisplay.fill(-1);
 	_notes.resize(MAX_NOTES_IN_FLIGHT);
 	_notesInfos.resize(MAX_NOTES_IN_FLIGHT);
+	_noteStartTimes.assign(MAX_NOTES_IN_FLIGHT, 0.0);
 	_allMessages.reserve(MAX_NOTES_IN_FLIGHT);
 	_secondsPerMeasure = computeMeasureDuration(_tempo, _signatureNum / _signatureDenom);
-	_pedalInfos[-10000.0f] = Pedals();
+	_pedalInfos[-10000.0] = Pedals();
 
 	_dirtyNotes = true;
 	_dirtyNotesRange = {0, 0}; // Full array
@@ -55,10 +68,12 @@ MIDISceneLive::MIDISceneLive(int port, bool verbose) : MIDIScene() {
 void MIDISceneLive::updateSetsAndVisibleNotes(const SetOptions & options, const FilterOptions& filter){
 	_currentSetOption = options;
 	
-	for(size_t nid = 0; nid < _notesCount; ++nid){
+	// _notesCount keeps growing past the ring buffer size, only the stored notes can be updated.
+	const size_t storedCount = size_t((std::min)(_notesCount, MAX_NOTES_IN_FLIGHT));
+	for(size_t nid = 0; nid < storedCount; ++nid){
 		auto & note = _notes[nid];
-		// Restore channel from note infos.
-		const int set = _currentSetOption.apply(int(note.note), _notesInfos[nid].channel, 0, note.start);
+		// Restore key and channel from note infos (note.note is the rendering index, not the key).
+		const int set = _currentSetOption.apply(int(_notesInfos[nid].note), _notesInfos[nid].channel, 0, note.start);
 		note.set = float(set);
 	}
 
@@ -81,7 +96,8 @@ void MIDISceneLive::updatesActiveNotes(double time, double speed, const FilterOp
 	int minUpdated = MAX_NOTES_IN_FLIGHT;
 	int maxUpdated = 0;
 
-	// If we are paused, just empty the queue.
+	// If we are paused, drain the queue but still honour note-offs so that a note
+	// released while paused doesn't stay "recording" (and stuck) once we resume.
 	if(_previousTime == time){
 		while(true){
 			auto message = shared().get_message();
@@ -89,8 +105,40 @@ void MIDISceneLive::updatesActiveNotes(double time, double speed, const FilterOp
 				// End of the queue.
 				break;
 			}
+			if(message.is_note_on_or_off()){
+				const bool isOff = (message.get_message_type() != libremidi::message_type::NOTE_ON) || (clamp<short>(short(message[2]), 0, 127) == 0);
+				if(isOff){
+					releaseRawKey(clamp<short>(short(message[1]), 0, 127));
+				}
+			}
 		}
 		return;
+	}
+
+	// If the render loop was stalled (app backgrounded / AFK), the frame gap is huge
+	// and any note still "recording" would otherwise absorb the whole gap into its
+	// duration (a giant stuck note). Detect the gap and close recording notes at the
+	// last good frame time instead, so their real note-offs (queued during the stall)
+	// become harmless no-ops and notes played after resume start fresh.
+	const double dt = time - _previousTime;
+	if(dt > LIVE_STALL_GAP){
+		for(size_t nid = 0; nid < _activeRecording.size(); ++nid){
+			if(!_activeRecording[nid]){
+				continue;
+			}
+			const int noteId = _activeIds[nid];
+			if(noteId >= 0){
+				// Cap the duration at the last good frame time, not the resumed time.
+				const double heldFor = _previousTime - _noteStartTimes[noteId];
+				_notes[noteId].duration = (std::max)(float(heldFor), 0.0f);
+			}
+			_activeRecording[nid] = false;
+			_actives[nid] = -1;
+			_activeIds[nid] = -1;
+		}
+		_rawToDisplay.fill(-1);
+		_dirtyNotes = true;
+		_dirtyNotesRange = {0, 0}; // full refresh; a stall is rare
 	}
 
 	// Update the particle systems lifetimes.
@@ -117,7 +165,16 @@ void MIDISceneLive::updatesActiveNotes(double time, double speed, const FilterOp
 		}
 		const int noteId = _activeIds[nid];
 		GPUNote & note = _notes[noteId];
-		note.duration = (std::max)(float(time - double(note.start)), 0.0f);
+		// Use the double-precision start so the duration stays exact after long uptime.
+		const double heldFor = time - _noteStartTimes[noteId];
+		// Watchdog: a note held longer than any real note means its note-off was
+		// lost. Force-close it instead of letting the rectangle grow forever.
+		if(heldFor > STUCK_NOTE_TIMEOUT){
+			_activeRecording[nid] = false;
+			_actives[nid] = -1;
+			continue;
+		}
+		note.duration = (std::max)(float(heldFor), 0.0f);
 		_actives[nid] = int(note.set);
 		// Keep track of which region was modified.
 		minUpdated = (std::min)(minUpdated, noteId);
@@ -126,7 +183,7 @@ void MIDISceneLive::updatesActiveNotes(double time, double speed, const FilterOp
 
 	// Restore pedals to the last known state.
 	_pedals = Pedals();
-	auto nextBig = _pedalInfos.upper_bound(float(time));
+	auto nextBig = _pedalInfos.upper_bound(time);
 	if(nextBig != _pedalInfos.begin()){
 		_pedals = std::prev(nextBig)->second;
 	}
@@ -149,27 +206,52 @@ void MIDISceneLive::updatesActiveNotes(double time, double speed, const FilterOp
 		const auto type = message.get_message_type();
 		// Handle note events.
 		if(message.is_note_on_or_off()){
-			const short note = clamp<short>(short(message[1]), 0, 127);
+			// Visual transpose (display only): shift the note used for all screen
+			// bookkeeping (recording slot, highlight, geometry). The raw message stored
+			// in _allMessages is untouched, so recordings export at original pitch.
+			const short raw = clamp<short>(short(message[1]), 0, 127);
+			const int shifted = int(raw) + _transpose;
+			const bool onScreen = shifted >= 0 && shifted <= 127;
+			const short note = short(shifted);
 			const short velocity = clamp<short>(short(message[2]), 0, 127);
 
 			if(_verbose){
 				std::cout << "Note: " << int(note) << " " << int(velocity) << " " << (type == libremidi::message_type::NOTE_ON ? "on" : "off")<< "(" << message.timestamp << ")\n";
 			}
 
-			// If the note is currently recording, disable it.
-			if(_activeRecording[note]){
-				_activeRecording[note] = false;
-				_actives[note] = -1;
-				// Duration has already been updated above.
-			}
+			// End the note this key was drawing, on the slot it was drawn on at
+			// note-on (even if the transpose changed since). Duration was updated above.
+			releaseRawKey(raw);
 
 			// If this is an on event with positive velocity, start a new note.
-			if(type == libremidi::message_type::NOTE_ON && velocity > 0){
+			// Keys transposed off the 0-127 range are recorded but not drawn.
+			if(type == libremidi::message_type::NOTE_ON && velocity > 0 && onScreen){
+
+				// Another key may still be drawing on this slot (transpose changed
+				// while it was held): end it so the two don't share bookkeeping.
+				if(_activeRecording[note]){
+					_activeRecording[note] = false;
+					_actives[note] = -1;
+				}
+				clearDisplayOwner(note);
 
 				const int index = _notesCount % MAX_NOTES_IN_FLIGHT;
+				// The ring buffer wraps after MAX_NOTES_IN_FLIGHT notes. If the slot we
+				// are about to reuse still belongs to a note that is being recorded,
+				// force-close that note first so its bookkeeping doesn't desync (which
+				// would leave a rectangle growing forever).
+				for(size_t pid = 0; pid < _activeRecording.size(); ++pid){
+					if(_activeRecording[pid] && _activeIds[pid] == index){
+						_activeRecording[pid] = false;
+						_actives[pid] = -1;
+						_activeIds[pid] = -1;
+						clearDisplayOwner(short(pid));
+					}
+				}
 				// Get new note.
 				auto & newNote = _notes[index];
 				newNote.start = float(time);
+				_noteStartTimes[index] = time;
 				newNote.duration = 0.0f;
 				newNote.note = note;
 				// Save the original channel.
@@ -181,6 +263,7 @@ void MIDISceneLive::updatesActiveNotes(double time, double speed, const FilterOp
 				// Activate recording of the key.
 				_activeRecording[note] = true;
 				_activeIds[note] = index;
+				_rawToDisplay[raw] = note;
 
 				// Compute proper rendering note.
 				const bool isMin = noteIsMinor[note % 12];
@@ -199,7 +282,7 @@ void MIDISceneLive::updatesActiveNotes(double time, double speed, const FilterOp
 					if(particle.note < 0){
 						// Update with new note parameter.
 						//const float durationTweak = 3.0f - float(velocity) / 127.0f * 2.5f;
-						particle.duration = 10.0f; // Fixed value.
+						particle.duration = _particlesDuration;
 						particle.start = newNote.start;
 						particle.note = note;
 						particle.set = int(newNote.set);
@@ -260,7 +343,12 @@ void MIDISceneLive::updatesActiveNotes(double time, double speed, const FilterOp
 				pedal = float(val)/127.0f;
 			}
 			// Register new pedal event with updated state.
-			_pedalInfos[float(time)] = Pedals(_pedals);
+			_pedalInfos[time] = Pedals(_pedals);
+			// Keep the pedal history bounded during very long sessions. We always
+			// retain the most recent events (which hold the current pedal state).
+			while(_pedalInfos.size() > MAX_STORED_PEDAL_EVENTS){
+				_pedalInfos.erase(_pedalInfos.begin());
+			}
 		} else {
 			if(_verbose){
 				std::cout << "Other (" << message.timestamp << ")\n";
@@ -271,6 +359,14 @@ void MIDISceneLive::updatesActiveNotes(double time, double speed, const FilterOp
 	// Insert all messages treated this frame in a new frame.
 	if(!frame.messages.empty()){
 		_allMessages.push_back(std::move(frame));
+		// Bound the saved-message history so a multi-hour session can't grow memory
+		// without limit. Only the oldest frames (already off-screen) are dropped.
+		// Trim in one large chunk so the costly front erase runs rarely, not every frame.
+		if(_allMessages.size() > MAX_STORED_FRAMES){
+			const size_t keep = MAX_STORED_FRAMES * 9 / 10;
+			_allMessages.erase(_allMessages.begin(), _allMessages.begin() + (_allMessages.size() - keep));
+			_historyTrimmed = true;
+		}
 	}
 
 	// Update completed notes.
@@ -282,22 +378,26 @@ void MIDISceneLive::updatesActiveNotes(double time, double speed, const FilterOp
 		}
 
 		auto& note = _notes[i];
+		// Use the double-precision start so onset/end detection stays exact even
+		// when the timeline has been running for hours (a float start would only
+		// resolve to ~8ms and could miss the one-frame windows below).
+		const double noteStart = _noteStartTimes[i];
+		const double noteEnd = noteStart + double(note.duration);
 		// Ignore notes that ended at this frame.
-		float noteEnd = note.start + note.duration;
 		if(noteEnd > _previousTime && noteEnd <= time){
 			continue;
 		}
 		// Update for notes currently playins.
-		if(note.start <= time && note.start+note.duration >= time){
+		if(noteStart <= time && noteEnd >= time){
 			_actives[noteId.note] = int(note.set);
 		}
 		// Detect notes that started at this frame.
-		if(note.start > _previousTime && note.start <= time){
+		if(noteStart > _previousTime && noteStart <= time){
 			// Find an available particles system and update it with the note parameters.
 			for(auto & particle : _particles){
 				if(particle.note < 0){
 					// Update with new note parameter.
-					particle.duration = (std::max)(note.duration*2.0f, note.duration + 1.2f);
+					particle.duration = _particlesDuration;
 					particle.start = note.start;
 					particle.note = noteId.note;
 					particle.set = int(note.set);
@@ -357,8 +457,9 @@ void MIDISceneLive::save(std::ofstream& file) const {
 		return a.timestamp < b.timestamp;
 	});
 
-	// For each frame, update all messages timestamp.
-	double currentTime = 0.0;
+	// For each frame, update all messages timestamp. If the oldest history was
+	// dropped, start at the first kept frame instead of a long leading silence.
+	double currentTime = (_historyTrimmed && !allMessages.empty()) ? allMessages.front().timestamp : 0.0;
 
 	for(MIDIFrame& frame : allMessages){
 		// Skip empty frames (should not exist), don't udpate the timing.
@@ -399,13 +500,49 @@ const std::string& MIDISceneLive::deviceName() const {
 	return _deviceName;
 }
 
+void MIDISceneLive::resetStuckNotes(){
+	// Force-close every recording note. The note keeps whatever duration it has
+	// so far; it just stops growing. This recovers from a lost note-off without
+	// needing to restart the app and reconnect the device.
+	for(size_t nid = 0; nid < _activeRecording.size(); ++nid){
+		_activeRecording[nid] = false;
+		_actives[nid] = -1;
+		_activeIds[nid] = -1;
+	}
+	_rawToDisplay.fill(-1);
+	_dirtyNotes = true;
+	_dirtyNotesRange = {0, 0};
+}
+
+void MIDISceneLive::releaseRawKey(short raw){
+	const short display = _rawToDisplay[raw];
+	if(display < 0){
+		return;
+	}
+	if(_activeRecording[display]){
+		_activeRecording[display] = false;
+		_actives[display] = -1;
+	}
+	_rawToDisplay[raw] = -1;
+}
+
+void MIDISceneLive::clearDisplayOwner(short display){
+	for(auto & slot : _rawToDisplay){
+		if(slot == display){
+			slot = -1;
+		}
+	}
+}
+
 libremidi::midi_in * MIDISceneLive::_sharedMIDIIn = nullptr;
 std::vector<std::string> MIDISceneLive::_availablePorts;
 int MIDISceneLive::_refreshIndex = 0;
 
 libremidi::midi_in & MIDISceneLive::shared(){
 	if(_sharedMIDIIn == nullptr){
-		_sharedMIDIIn = new libremidi::midi_in(libremidi::API::UNSPECIFIED, "MIDIVisualizer");
+		// The default queue (100 messages) drops events, note-offs included, when a slow
+		// frame coincides with a burst of notes and pedal CCs. Use a much larger one.
+		_sharedMIDIIn = new libremidi::midi_in(libremidi::API::UNSPECIFIED, "MIDIVisualizer", 4096);
 	}
 	return *_sharedMIDIIn;
 }

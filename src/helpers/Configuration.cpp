@@ -108,6 +108,9 @@ Configuration::Configuration(const std::string& path, const std::vector<std::str
 			if(name == "device" && vals.size() >= 1){
 				lastMidiDevice = join(vals, " ");
 			}
+			if(name == "midi-out" && vals.size() >= 1){
+				lastMidiOutput = join(vals, " ");
+			}
 		}
 		// Export options
 		{
@@ -262,6 +265,9 @@ void Configuration::save(const std::string& path){
 	if(!lastMidiDevice.empty()){
 		outFile << "device " << lastMidiDevice << "\n";
 	}
+	if(!lastMidiOutput.empty()){
+		outFile << "midi-out " << lastMidiOutput << "\n";
+	}
 
 	// Window options
 	outFile << "size " << windowSize[0] << " " << windowSize[1] << "\n";
@@ -288,6 +294,7 @@ void Configuration::printHelp(){
 	const std::vector<std::pair<std::string, std::string>> genOpts = {
 		{"midi", "path to a MIDI file to load"},
 		{"device", "name of a MIDI device to start a live session to (or VIRTUAL to act as a virtual device)"},
+		{"midi-out", "name of a MIDI output port to send file playback to (e.g. Pianoteq via IAC Driver Bus 1)"},
 		{"config", "path to a configuration INI file"},
 		{"size", "dimensions of the window (--size W H)"},
 		{"position", "position of the window (--position X Y)"},

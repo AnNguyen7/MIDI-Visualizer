@@ -4,6 +4,7 @@
 #include <glm/glm.hpp>
 #include <memory>
 #include <array>
+#include <string>
 
 #include "Framebuffer.h"
 #include "camera/Camera.h"
@@ -16,6 +17,8 @@
 #include "Renderer.h"
 
 #define DEBUG_SPEED (1.0f)
+
+struct ImVec2;
 
 struct SystemAction {
 	enum Type {
@@ -44,7 +47,7 @@ public:
 	void setState(const State & state);
 	
 	/// Draw function
-	SystemAction draw(const float currentTime);
+	SystemAction draw(const double currentTime);
 	
 	/// Clean function
 	void clean();
@@ -64,6 +67,11 @@ public:
 	bool startDirectRecording(const Export& exporting, const glm::vec2 & size);
 
 	void setGUIScale(float scale);
+
+	float guiScale() const { return _guiScale; }
+
+	/// The settings panel is being rescaled by dragging its corner.
+	bool isResizingPanel() const { return _resizingPanel; }
 
 	void updateConfiguration(Configuration& config);
 
@@ -103,11 +111,41 @@ private:
 	
 	void drawWaves(const glm::vec2 & invSize);
 
-	SystemAction drawGUI(const float currentTime);
+	SystemAction drawGUI(const double currentTime);
 
 	void drawScene(bool transparentBG);
 
-	SystemAction showTopButtons(double currentTime);
+	void showTopButtons(double currentTime);
+
+	void showStatusLine();
+
+	void showSessionTab();
+
+	void showPlaybackTab();
+
+	void showSceneTab();
+
+	void showEffectsTab();
+
+	SystemAction showDisplayTab();
+
+	/// Begin a tab of the settings panel, marking it when active.
+	bool beginTab(const char* label);
+
+	/// Small title introducing a group of controls.
+	void sectionTitle(const char* label);
+
+	/// Draw a title in spaced capitals between two diamonds, centered in a row.
+	void ornamentTitle(const char* label, const ImVec2& rowMin, const ImVec2& rowMax);
+
+	/// Button filling one column of the two-columns grid.
+	bool gridButton(const char* label);
+
+	/// Corner grip of the settings panel, dragging it rescales the whole interface.
+	void panelResizeGrip();
+
+	/// Collapsible section for a layer, with a checkbox to show/hide the layer.
+	bool layerSection(const char* label, bool& enabled);
 
 	void showNoteOptions();
 
@@ -153,6 +191,9 @@ private:
 	
 	void reset();
 
+	/// Seek the file playback timeline by deltaSeconds (YouTube-style). File mode only.
+	void seek(double deltaSeconds);
+
 	void startRecording();
 
 	void updateSizes();
@@ -167,12 +208,19 @@ private:
 
 	void ImGuiSameLine(int w = 0);
 
+	// Light vertical breathing room between GUI groups (a calm alternative to a
+	// full-width separator, for a more minimalist rhythm).
+	void guiSeparatorSpacing();
+
 	State _state;
 	std::array<Layer, Layer::COUNT> _layers;
 	State _backupState;
 
-	float _timer = 0.0f;
-	float _timerStart = 0.0f;
+	// Kept in double precision so that the timeline stays accurate even after
+	// the app has been running for many hours (a float loses ~8ms of resolution
+	// once the value reaches tens of thousands of seconds).
+	double _timer = 0.0;
+	double _timerStart = 0.0;
 	bool _shouldPlay = false;
 	bool _showGUI = true;
 	bool _showDebug = false;
@@ -199,6 +247,11 @@ private:
 	float _guiScale = 1.0f;
 	unsigned int _shouldQuit = 0;
 	int _selectedPort = 0;
+	bool _panelScrolls = false; ///< The settings panel had a scrollbar on the last frame.
+	bool _resizingPanel = false; ///< The corner grip of the settings panel is being dragged.
+	float _resizeGrabOffset = 0.0f; ///< Distance between the cursor and the panel edge when the drag started.
+	float _pendingGuiScale = 0.0f; ///< Scale requested by the grip, applied at the beginning of the next frame.
+	std::string _selectedTab = "Session"; ///< Tab of the settings panel selected on the last frame.
 	bool _showLayers = false;
 	bool _showSetListEditor = false;
 	bool _showParticleEditor = false;
@@ -206,6 +259,7 @@ private:
 	bool _exitAfterRecording = false;
 	bool _fullscreen = false;
 	bool _liveplay = false;
+	std::string _midiOutputName; ///< Remembered MIDI output port, auto-applied on file load.
 	bool _useTransparency = false;
 	const bool _supportTransparency;
 };

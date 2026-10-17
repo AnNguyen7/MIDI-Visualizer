@@ -1376,7 +1376,7 @@ void ImGui::SeparatorEx(ImGuiSeparatorFlags flags)
         if (!ItemAdd(bb, 0))
             return;
 
-        // Draw
+// Draw
         window->DrawList->AddLine(ImVec2(bb.Min.x, bb.Min.y), ImVec2(bb.Min.x, bb.Max.y), GetColorU32(ImGuiCol_Separator));
         if (g.LogEnabled)
             LogText(" |");
@@ -3020,6 +3020,13 @@ bool ImGui::SliderScalar(const char* label, ImGuiDataType data_type, void* p_dat
     else if (data_type == ImGuiDataType_S32 && strcmp(format, "%d") != 0) // (FIXME-LEGACY: Patch old "%.0f" format string to use "%d", read function more details.)
         format = PatchFormatStringFloatToInt(format);
 
+    // [fork] Classic look: the slider is a thin line with a ring knob, the value is displayed on its right.
+    // Split the frame between the two, the value taking the room its text needs.
+    char value_buf[64];
+    const char* value_buf_end = value_buf + DataTypeFormatString(value_buf, IM_ARRAYSIZE(value_buf), data_type, p_data, format);
+    const float value_w = ImFloor(ImClamp(CalcTextSize(value_buf, value_buf_end).x + style.ItemInnerSpacing.x, w * 0.38f, w * 0.70f));
+    const ImRect track_bb(frame_bb.Min, ImVec2(frame_bb.Max.x - value_w, frame_bb.Max.y));
+
     // Tabbing or CTRL-clicking on Slider turns it into an input box
     const bool hovered = ItemHoverable(frame_bb, id);
     bool temp_input_is_active = temp_input_allowed && TempInputIsActive(id);
@@ -3027,13 +3034,15 @@ bool ImGui::SliderScalar(const char* label, ImGuiDataType data_type, void* p_dat
     {
         const bool input_requested_by_tabbing = temp_input_allowed && (g.LastItemData.StatusFlags & ImGuiItemStatusFlags_FocusedByTabbing) != 0;
         const bool clicked = (hovered && g.IO.MouseClicked[0]);
-        if (input_requested_by_tabbing || clicked || g.NavActivateId == id || g.NavActivateInputId == id)
+        const bool double_clicked = (hovered && g.IO.MouseDoubleClicked[0]); // [fork] double-click opens type box
+        const bool clicked_value = clicked && g.IO.MousePos.x > track_bb.Max.x; // [fork] clicking the value opens type box
+        if (input_requested_by_tabbing || clicked || double_clicked || g.NavActivateId == id || g.NavActivateInputId == id)
         {
             SetActiveID(id, window);
             SetFocusID(id, window);
             FocusWindow(window);
             g.ActiveIdUsingNavDirMask |= (1 << ImGuiDir_Left) | (1 << ImGuiDir_Right);
-            if (temp_input_allowed && (input_requested_by_tabbing || (clicked && g.IO.KeyCtrl) || g.NavActivateInputId == id))
+            if (temp_input_allowed && (input_requested_by_tabbing || (clicked && g.IO.KeyCtrl) || clicked_value || double_clicked || g.NavActivateInputId == id))
                 temp_input_is_active = true;
         }
     }
@@ -3045,27 +3054,32 @@ bool ImGui::SliderScalar(const char* label, ImGuiDataType data_type, void* p_dat
         return TempInputScalar(frame_bb, id, label, data_type, p_data, format, is_clamp_input ? p_min : NULL, is_clamp_input ? p_max : NULL);
     }
 
-    // Draw frame
-    const ImU32 frame_col = GetColorU32(g.ActiveId == id ? ImGuiCol_FrameBgActive : hovered ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg);
+    // [fork] No frame, only the line of the track.
     RenderNavHighlight(frame_bb, id);
-    RenderFrame(frame_bb.Min, frame_bb.Max, frame_col, true, g.Style.FrameRounding);
+    const float line_thickness = ImMax(1.0f, g.FontSize * 0.09f);
+    const float track_y = ImFloor((track_bb.Min.y + track_bb.Max.y) * 0.5f) + 0.5f;
+    window->DrawList->AddLine(ImVec2(track_bb.Min.x + 2.0f, track_y), ImVec2(track_bb.Max.x - 2.0f, track_y), GetColorU32(ImGuiCol_SliderGrab), line_thickness);
 
     // Slider behavior
     ImRect grab_bb;
-    const bool value_changed = SliderBehavior(frame_bb, id, data_type, p_data, p_min, p_max, format, flags, &grab_bb);
+    const bool value_changed = SliderBehavior(track_bb, id, data_type, p_data, p_min, p_max, format, flags, &grab_bb);
     if (value_changed)
         MarkItemEdited(id);
 
-    // Render grab
+    // [fork] Render grab as a ring knob.
     if (grab_bb.Max.x > grab_bb.Min.x)
-        window->DrawList->AddRectFilled(grab_bb.Min, grab_bb.Max, GetColorU32(g.ActiveId == id ? ImGuiCol_SliderGrabActive : ImGuiCol_SliderGrab), style.GrabRounding);
+    {
+        const ImVec2 knob_center(ImFloor((grab_bb.Min.x + grab_bb.Max.x) * 0.5f) + 0.5f, track_y);
+        const float knob_radius = style.GrabMinSize * 0.5f - 1.0f;
+        window->DrawList->AddCircleFilled(knob_center, knob_radius, GetColorU32(g.ActiveId == id ? ImGuiCol_FrameBgActive : hovered ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg), 24);
+        window->DrawList->AddCircle(knob_center, knob_radius, GetColorU32(g.ActiveId == id ? ImGuiCol_SliderGrabActive : ImGuiCol_SliderGrab), 24, line_thickness * 1.3f);
+    }
 
     // Display value using user-provided display format so user can add prefix/suffix/decorations to the value.
-    char value_buf[64];
-    const char* value_buf_end = value_buf + DataTypeFormatString(value_buf, IM_ARRAYSIZE(value_buf), data_type, p_data, format);
+    value_buf_end = value_buf + DataTypeFormatString(value_buf, IM_ARRAYSIZE(value_buf), data_type, p_data, format);
     if (g.LogEnabled)
         LogSetNextTextDecoration("{", "}");
-    RenderTextClipped(frame_bb.Min, frame_bb.Max, value_buf, value_buf_end, NULL, ImVec2(0.5f, 0.5f));
+    RenderTextClipped(ImVec2(track_bb.Max.x, frame_bb.Min.y), frame_bb.Max, value_buf, value_buf_end, NULL, ImVec2(1.0f, 0.5f));
 
     if (label_size.x > 0.0f)
         RenderText(ImVec2(frame_bb.Max.x + style.ItemInnerSpacing.x, frame_bb.Min.y + style.FramePadding.y), label);

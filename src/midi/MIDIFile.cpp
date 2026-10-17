@@ -173,11 +173,11 @@ void MIDIFile::mergeTracks(){
 	
 }
 
-void MIDIFile::getNotes(std::vector<MIDINote> & notes, NoteType type, const FilterOptions& filter, size_t track) const {
+void MIDIFile::getNotes(std::vector<MIDINote> & notes, NoteType type, const FilterOptions& filter, size_t track, int transpose) const {
 	if(track >= _tracks.size()){
 		return;
 	}
-	_tracks[track].getNotes(notes, type, filter );
+	_tracks[track].getNotes(notes, type, filter, transpose );
 }
 
 void MIDIFile::getNotesActive(ActiveNotesArray & actives, double time, const FilterOptions& filter, size_t track) const {

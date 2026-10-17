@@ -178,6 +178,7 @@ void State::defineOptions(){
 
 	// Playback
 	_sharedInfos[s_time_scale_key] 			= {Category::PLAYBACK, s_time_scale_dsc, Type::FLOAT};
+	_sharedInfos[s_transpose_key] 			= {Category::PLAYBACK, s_transpose_dsc, Type::INTEGER, {-24.0f, 24.0f}};
 	_sharedInfos[s_preroll_key] 			= {Category::PLAYBACK, s_preroll_dsc, Type::FLOAT};
 	_sharedInfos[s_scroll_speed_key] 		= {Category::PLAYBACK, s_scroll_speed_dsc, Type::FLOAT};
 	_sharedInfos[s_scroll_reverse_key] 		= {Category::PLAYBACK, s_scroll_reverse_dsc, Type::BOOLEAN};
@@ -221,11 +222,11 @@ void State::defineOptions(){
 
 	// Particles
 	_sharedInfos[s_particles_count_key] 		= {Category::PARTICLES, s_particles_count_dsc, Type::INTEGER, {1.0f, 512.0f}};
-	_sharedInfos[s_particles_size_key] 			= {Category::PARTICLES, s_particles_size_dsc, Type::FLOAT, {1.0f, 10.0f}};
-	_sharedInfos[s_particles_speed_key] 		= {Category::PARTICLES, s_particles_speed_dsc, Type::FLOAT};
-	_sharedInfos[s_particles_expansion_key] 	= {Category::PARTICLES, s_particles_expansion_dsc, Type::FLOAT};
+	_sharedInfos[s_particles_size_key] 			= {Category::PARTICLES, s_particles_size_dsc, Type::FLOAT, {0.1f, 10.0f}};
 	_sharedInfos[s_particles_paths_key] 		= {Category::PARTICLES, s_particles_paths_dsc, Type::PATH};
 	_sharedInfos[s_particles_turbulences_key] 	= {Category::PARTICLES, s_particles_turbulences_dsc, Type::FLOAT, {0.f, 10.f}};
+	_sharedInfos[s_particles_float_height_key] 	= {Category::PARTICLES, s_particles_float_height_dsc, Type::FLOAT, {0.1f, 3.f}};
+	_sharedInfos[s_particles_lifetime_key] 		= {Category::PARTICLES, s_particles_lifetime_dsc, Type::FLOAT, {0.2f, 10.f}};
 
 	// Pedal
 	_sharedInfos[s_pedal_size_key] 				= {Category::PEDAL, s_pedal_size_dsc, Type::FLOAT, {0.05f, 0.5f}};
@@ -390,9 +391,9 @@ void State::updateOptions(){
 	_floatInfos[s_time_scale_key] = &scale;
 	_floatInfos[s_minor_size_key] = &background.minorsWidth;
 	_floatInfos[s_particles_size_key] = &particles.scale;
-	_floatInfos[s_particles_speed_key] = &particles.speed;
-	_floatInfos[s_particles_expansion_key] = &particles.expansion;
-	_floatInfos[s_particles_turbulences_key] = &particles.turbulenceStrength;
+	_floatInfos[s_particles_turbulences_key] = &particles.sway;
+	_floatInfos[s_particles_float_height_key] = &particles.floatHeight;
+	_floatInfos[s_particles_lifetime_key] = &particles.lifetime;
 	_floatInfos[s_blur_attenuation_key] = &attenuation;
 	_floatInfos[s_flashes_size_key] = &flashes.size;
 	_floatInfos[s_flashes_halo_inner_key] = &flashes.haloInnerRadius;
@@ -442,6 +443,7 @@ void State::updateOptions(){
 
 	_intInfos[s_min_key_key] = &minKey;
 	_intInfos[s_max_key_key] = &maxKey;
+	_intInfos[s_transpose_key] = &transpose;
 
 	_boolInfos[s_show_pedal_key] = &showPedal;
 	_floatInfos[s_pedal_size_key] = &pedals.size;
@@ -845,22 +847,23 @@ void State::reset(){
 	score.digitsScale = 0.08f;
 	score.digitsOffset = {0, 0};
 
-	particles.speed = 0.2f;
-	particles.expansion = 1.0f;
 	particles.scale = 1.0f;
-	particles.count = 256;
+	particles.count = 14;
 	particles.imagePaths.clear();
 	const GLuint blankID = ResourcesManager::getTextureFor("blankarray");
 	particles.tex = blankID;
 	particles.texCount = 1;
 
-	particles.turbulenceStrength = 1.0;
-	particles.turbulenceScale = 1.0;
+	// A few leaves floating up from the key.
+	particles.sway = 1.0f;
+	particles.floatHeight = 1.0f;
+	particles.lifetime = 3.0f;
 
 	
 	quality = Quality::MEDIUM;
 	prerollTime = 1.0f;
 	scrollSpeed = 1.0f;
+	transpose = 0;
 	keyboard.highlightKeys = true;
 	keyboard.minorEdges = true;
 	keyboard.customKeyColors = false;
@@ -953,8 +956,10 @@ void State::loadLegacy(std::istream & configFile, int majVersion, int minVersion
 		configFile >> score.digits ;
 		configFile >> showKeyboard ;
 
-		configFile >> particles.speed ;
-		configFile >> particles.expansion ;
+		// Particles speed and expansion, not used anymore.
+		float unusedSpeed, unusedExpansion;
+		configFile >> unusedSpeed ;
+		configFile >> unusedExpansion ;
 		configFile >> particles.count ;
 	}
 

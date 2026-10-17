@@ -7,23 +7,21 @@ uniform float time;
 uniform float scale;
 uniform vec3 baseColor[SETS_COUNT];
 uniform vec2 inverseScreenSize;
-uniform sampler2D textureParticles;
-uniform vec2 inverseTextureSize;
-uniform sampler2D textureNoise;
+uniform float pixelScale = 1.0; // rendered pixels per pixel of the final image
 
 uniform int globalId;
-uniform float duration;
+uniform float duration; // seconds the leaves of a note last, from the note until they have vanished
 uniform int channel;
 
 uniform int texCount;
 uniform float colorScale;
 
-uniform float expansionFactor = 1.0;
-uniform float speedScaling = 0.2;
 uniform float keyboardHeight = 0.25;
 
-uniform float turbulenceStrength;
-uniform float turbulenceScale;
+// Floating controls.
+uniform float floatHeight = 1.0; // how high the leaves rise
+uniform float sway = 1.0;        // how far they swing from side to side
+uniform float seed = 0.0;        // changes with each note so repeated notes differ
 
 uniform int minNote;
 uniform float notesCount;
@@ -52,61 +50,69 @@ float rand(vec2 co){
 void main(){
 	Out.id = float(gl_InstanceID % texCount);
 	Out.uv = v + 0.5;
-	// Fade color based on time.
-	Out.color = vec4(colorScale * baseColor[channel], 1.0-time*time);
-	
-	float localTime = speedScaling * time * duration;
-	float particlesCount = 1.0/inverseTextureSize.y;
-	
-	// Pick particle id at random.
-	float particleId = float(gl_InstanceID) + floor(particlesCount * 10.0 * rand(vec2(globalId,globalId)));
-	float textureId = mod(particleId,particlesCount);
-	float particleShift = floor(particleId/particlesCount);
-	
-	// Particle uv, in pixels.
-	vec2 particleUV = vec2(localTime / inverseTextureSize.x + 10.0 * particleShift, textureId);
-	// UV in [0,1]
-	particleUV = (particleUV+0.5)*vec2(1.0,-1.0)*inverseTextureSize;
-	// Avoid wrapping.
-	particleUV.x = clamp(particleUV.x,0.0,1.0);
-	// We want to skip reading from the very beginning of the trajectories because they are identical.
-	// particleUV.x = 0.95 * particleUV.x + 0.05;
-	// Read corresponding trajectory to get particle current position.
-	vec3 position = texture(textureParticles, particleUV).xyz;
-	// Center position (from [0,1] to [-0.5,0.5] on x axis.
-	position.x -= 0.5;
-	
-	// Compute shift, randomly disturb it.
-	vec2 shift = 0.5*position.xy;
-	float random = rand(vec2(particleId + float(globalId),time*0.000002+100.0*float(globalId)));
-	shift += vec2(0.0,0.1*random);
-	
-	// Scale shift with time (expansion effect).
-	shift = shift*time*expansionFactor;
-	// and with altitude of the particle (ditto).
-	shift.x *= max(0.5, pow(shift.y,0.3));
-	
+
+	// Per-particle random values, different for each note.
+	float particleId = float(gl_InstanceID);
+	float noteSeed = seed + 1.37 * float(globalId);
+	float randBorn = rand(vec2(particleId + 23.9, noteSeed + 6.7));
+	float randLife = rand(vec2(particleId + 43.1, noteSeed + 9.4));
+	float randRise = rand(vec2(particleId + 31.7, noteSeed + 7.1));
+	float randSway = rand(vec2(particleId + 57.3, noteSeed + 3.7));
+	float randPhase = rand(vec2(particleId + 11.3, noteSeed + 5.3));
+	float randDrift = rand(vec2(particleId + 77.9, noteSeed + 2.9));
+	float randSpin = rand(vec2(particleId + 5.1, noteSeed + 4.4));
+
+	// Seconds since the note. The scene gives the animation a 0.25s head start,
+	// removed here so the leaves start from the key.
+	float seconds = max(time * duration - 0.25, 0.0);
+	// The leaves leave the key one after another, and each has its own lifespan,
+	// so they thin out progressively instead of vanishing all at once.
+	float born = 0.35 * duration * randBorn;
+	float age = max(seconds - born, 0.0);
+	float lifespan = (duration - born) * (0.7 + 0.3 * randLife);
+	float progress = clamp(age / lifespan, 0.0, 1.0);
+
+	// Small per-leaf brightness variation.
+	float bright = 0.75 + 0.4 * rand(vec2(particleId, 12.1));
+	// Appear softly, then fade out over the last third of the lifespan.
+	float alpha = smoothstep(0.0, 0.2, age) * (1.0 - smoothstep(0.65, 1.0, progress));
+	Out.color = vec4(colorScale * baseColor[channel] * bright, alpha);
+
 	// Horizontal shift is based on the note ID.
 	float xshift = -1.0 + ((shifts[globalId] - shifts[int(minNote)]) * 2.0 + 1.0) / notesCount;
-	//  Combine global shift (due to note id) and local shift (based on read position).
 	vec2 globalShift = vec2(xshift, (2.0 * keyboardHeight - 1.0)-0.02);
-	vec2 localShift = shift * duration * vec2(1.0,0.5);
-	vec2 vertexShift = 0.003 * scale * v;
+
+	float sizeVar = 0.7 + 0.6 * rand(vec2(particleId, 9.3));
+	float spriteSize = 0.012 * scale * sizeVar;
+	// A sprite smaller than a pixel of the final image would flicker or vanish: draw it
+	// at a minimal size and make it fainter instead, so that small sizes read as fine dust.
+	float spritePixels = 0.5 * spriteSize / inverseScreenSize.x;
+	float grow = max(1.0, 2.0 * pixelScale / max(spritePixels, 0.0001));
+	Out.color.a *= max(1.0 / grow, 0.3);
+
+	// Each leaf swings from side to side at its own rate.
+	float swing = 6.28318530718 * ((0.25 + 0.3 * randSway) * age + randPhase);
+	// It leans with its swing while slowly spinning, and its width is squashed
+	// back and forth to suggest that it flutters.
+	float angle = 6.28318530718 * randSpin + 0.6 * cos(swing) + 1.2 * (randSpin - 0.5) * age;
+	float flutter = 0.45 + 0.55 * abs(cos(0.8 * swing + 6.28318530718 * randDrift));
+	vec2 corner = vec2(flutter * v.x, v.y);
+	corner = vec2(cos(angle) * corner.x - sin(angle) * corner.y, sin(angle) * corner.x + cos(angle) * corner.y);
+	vec2 vertexShift = grow * spriteSize * corner;
 
 	float screenRatio = inverseScreenSize.y/inverseScreenSize.x;
 	vec2 screenScaling = vec2(1.0, horizontalMode ? (1.0/screenRatio) : screenRatio);
 
-	vec2 particlePos = globalShift + screenScaling * localShift;
+	// Float: rise out of the key, easing off with age, each leaf at its own pace.
+	float rise = 0.4 * floatHeight * (0.5 + 0.5 * randRise) * (1.0 - pow(1.0 - progress, 1.8));
+	// Start from slightly different spots across the key, then swing from side to side
+	// more and more widely while drifting a little to one side.
+	float side = 0.6 * (randDrift - 0.5) / notesCount;
+	side += sway * smoothstep(0.0, 0.35, progress) * (0.5 + 0.5 * randSway) * 0.035 * sin(swing);
+	side += sway * 0.1 * (randPhase - 0.5) * progress;
 
-	vec2 curlNoise = textureLod(textureNoise, turbulenceScale * particlePos.xy / screenScaling, 0).gb;
-	curlNoise.x = 2.0 * curlNoise.x - 1.0;
-	vec2 curlShift = 0.01 * turbulenceStrength * time * curlNoise;
-
-	vec2 finalPos = particlePos + screenScaling * (vertexShift + curlShift);
-	// Discard particles that reached the end of their trajectories by putting them off-screen.
-	finalPos = mix(vec2(-200.0),finalPos, position.z);
+	vec2 particlePos = globalShift + screenScaling * vec2(side, rise);
+	vec2 finalPos = particlePos + screenScaling * vertexShift;
 	// Output final particle position.
 	gl_Position = vec4(flipIfNeeded(finalPos), 0.0, 1.0);
-	
-	
 }

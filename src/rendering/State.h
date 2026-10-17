@@ -14,8 +14,11 @@
 #define MIDIVIZ_VERSION_MAJOR 7
 #define MIDIVIZ_VERSION_MINOR 3
 
-#define COLUMN_SIZE 170
-#define EXPORT_COLUMN_SIZE 200
+// Settings panel grid: two columns of (PANEL_WIDTH - 2 * 14 - 10) / 2, the second one starting at COLUMN_SIZE.
+#define COLUMN_SIZE 230
+#define ITEM_WIDTH 124
+#define PANEL_WIDTH 450
+#define EXPORT_COLUMN_SIZE 230
 
 typedef std::array<glm::vec3, SETS_COUNT> ColorArray;
 typedef std::vector<std::string> PathCollection;
@@ -93,12 +96,11 @@ public:
 		ColorArray colors; ///< Particles color.
 		GLuint tex;
 		int texCount; ///< Number of particle textures.
-		float speed; ///< Particles speed.
-		float expansion; ///< Expansion factor.
 		float scale; ///< Particles scale.
 		int count; ///< Number of particles.
-		float turbulenceScale; ///< Turbulence noise scale (not exposed)
-		float turbulenceStrength; ///< Turbulence intensity
+		float sway; ///< How far the particles swing from side to side.
+		float floatHeight; ///< How high the particles rise.
+		float lifetime; ///< Time in seconds from the note until its particles have vanished.
 	};
 
 	struct KeyboardState {
@@ -201,6 +203,7 @@ public:
 
 	int minKey; ///< The lowest key to display.
 	int maxKey; ///< The highest key to display.
+	int transpose; ///< Visual transpose in semitones (display only; matches Pianoteq).
 
 	bool showParticles;
 	bool showFlashes;

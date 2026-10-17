@@ -39,6 +39,9 @@ public:
 
 	void resetParticles();
 
+	/// Lifetime of a particles system, from the note until its particles have vanished.
+	void setParticlesDuration(float duration) { _particlesDuration = duration; }
+
 	virtual void updateSetsAndVisibleNotes( const SetOptions& options, const FilterOptions& filter );
 
 	virtual void updateVisibleNotes( const FilterOptions& filter);
@@ -75,11 +78,18 @@ public:
 
 	void setUpToDate() { _dirtyNotes = false; _dirtyNotesRange = {0, 0}; }
 
+	// Visual transpose in semitones (display only; the audio/MIDI output stays at
+	// original pitch so an external engine like Pianoteq owns the sound).
+	virtual void setTranspose(int t) { _transpose = t; }
+
 protected:
+
+	int _transpose = 0;
 
 	std::vector<GPUNote> _notes;
 	std::array<int, 128> _actives;
 	std::vector<Particles> _particles;
+	float _particlesDuration = 3.0f;
 	Pedals _pedals;
 	int _effectiveNotesCount = 0;
 

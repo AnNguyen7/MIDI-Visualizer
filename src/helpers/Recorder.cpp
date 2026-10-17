@@ -237,7 +237,8 @@ bool Recorder::drawGUI(float scale){
 	bool shouldStart = false;
 
 	if(ImGui::BeginPopupModal("Export", nullptr, ImGuiWindowFlags_AlwaysAutoResize)){
-		ImGui::PushItemWidth(scale * 100);
+		ImGui::paperBackground();
+		ImGui::PushItemWidth(scale * ITEM_WIDTH);
 		const float scaledColumn = scale * EXPORT_COLUMN_SIZE;
 
 		// Dropdown list.
@@ -373,6 +374,7 @@ void Recorder::drawProgress(){
 		ImGui::OpenPopup("Exporting...");
 	}
 	if(ImGui::BeginPopupModal("Exporting...", NULL, ImGuiWindowFlags_AlwaysAutoResize)){
+		ImGui::paperBackground();
 
 		ImGui::Text("Scene duration: %ds.", int(std::round(_sceneDuration)));
 		ImGui::Text("Framerate: %d fps.", _config.framerate);

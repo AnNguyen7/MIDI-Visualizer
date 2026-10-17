@@ -4,9 +4,12 @@
 #include "../helpers/System.h"
 #include "../resources/strings.h"
 
+#include <cctype>
+#include <cmath>
 #include <cstring>
 #include <glm/gtc/matrix_transform.hpp>
 #include <imgui/imgui.h>
+#include <imgui/imgui_internal.h>
 #include <iostream>
 #include <sr_gui.h>
 #include <stdio.h>
@@ -34,6 +37,7 @@ Viewer::Viewer(const Configuration& config) :
 	_fullscreen = config.fullscreen;
 	_windowSize = config.windowSize;
 	_useTransparency = config.useTransparency && _supportTransparency;
+	_midiOutputName = config.lastMidiOutput;
 
 	// GL options
 	glEnable(GL_CULL_FACE);
@@ -130,7 +134,7 @@ Viewer::Viewer(const Configuration& config) :
 Viewer::~Viewer() {}
 
 bool Viewer::loadFile(const std::string& midiFilePath) {
-	std::shared_ptr<MIDIScene> scene(nullptr);
+	std::shared_ptr<MIDISceneFile> scene(nullptr);
 
 	try {
 		scene = std::make_shared<MIDISceneFile>(midiFilePath, _state.setOptions, _state.filter);
@@ -145,6 +149,17 @@ bool Viewer::loadFile(const std::string& midiFilePath) {
 
 	// Init objects.
 	_scene = scene;
+	// Apply the visual transpose (display only) and rebuild note geometry so a
+	// persisted transpose shows immediately on load.
+	scene->setTranspose(_state.transpose);
+	scene->updateVisibleNotes(_state.filter);
+	// Auto-route file playback to the remembered MIDI output (e.g. Pianoteq via
+	// IAC Driver Bus 1) so the user doesn't have to re-pick it every session. If
+	// the port is currently unavailable this just logs and leaves output closed;
+	// we keep the remembered name so the next load retries.
+	if(!_midiOutputName.empty()){
+		scene->setMidiOutputByName(_midiOutputName);
+	}
 	applyAllSettings();
 	return true;
 }
@@ -167,7 +182,16 @@ bool Viewer::connectDevice(const std::string& deviceName) {
 		}
 	}
 
-	_scene = std::make_shared<MIDISceneLive>(_selectedPort, _verbose);
+	try {
+		_scene = std::make_shared<MIDISceneLive>(_selectedPort, _verbose);
+	} catch(const std::exception & e){
+		// The device can vanish between the listing and the opening.
+		std::cerr << "[MIDI] Unable to connect to device named " << deviceName << ": " << e.what() << std::endl;
+		return false;
+	}
+	// Apply the visual transpose (display only) so a persisted value applies to
+	// notes played from here on.
+	_scene->setTranspose(_state.transpose);
 	_timer = 0.0f;
 	// Don't start immediately
 	// _shouldPlay = true;
@@ -179,7 +203,7 @@ bool Viewer::connectDevice(const std::string& deviceName) {
 	return true;
 }
 
-SystemAction Viewer::draw(float currentTime) {
+SystemAction Viewer::draw(double currentTime) {
 
 	if(_recorder.isRecording()){
 		_timer = _recorder.currentTime();
@@ -229,6 +253,10 @@ SystemAction Viewer::draw(float currentTime) {
 
 void Viewer::drawScene(bool transparentBG){
 
+	// Only drive the external synth during real-time playback (not when paused or exporting).
+	if(auto fs = std::dynamic_pointer_cast<MIDISceneFile>(_scene)) fs->setOutputActive(_shouldPlay && !_recorder.isRecording());
+	// The particles of a note last for the lifetime, from the note until they have vanished.
+	_scene->setParticlesDuration(_state.particles.lifetime);
 	// Update active notes listing.
 	_scene->updatesActiveNotes(_state.scrollSpeed * _timer, _state.scrollSpeed, _state.filter);
 	// Let renderer update GPU data if needed.
@@ -293,7 +321,7 @@ void Viewer::blurPrepass() {
 	_passthrough.draw(_blurFramebuffer1->textureId(), _timer);
 	if (_state.showParticles) {
 		// Draw the new particles.
-		_renderer.drawParticles(_scene, _timer, invSizeB, _state.particles, true);
+		_renderer.drawParticles(_scene, _timer, invSizeB, _state.particles, Quality::availables.at(_state.quality).particlesResolution, true);
 	}
 	if (_state.showBlurNotes) {
 		// Draw the notes.
@@ -331,7 +359,7 @@ void Viewer::drawBackgroundImage(const glm::vec2 &) {
 	bgProg.uniform("textureAlpha", _state.background.imageAlpha);
 	bgProg.uniform("behindKeyboard", _state.background.imageBehindKeyboard);
 	bgProg.uniform("keyboardHeight", _state.keyboard.size);
-	bgProg.uniform("scroll", _timer * _state.background.scrollSpeed);
+	bgProg.uniform("scroll", float(_timer) * _state.background.scrollSpeed);
 	_backgroundTexture.draw(_state.background.tex, _timer);
 
 	glDisable(GL_BLEND);
@@ -344,7 +372,7 @@ void Viewer::drawBlur(const glm::vec2 &) {
 }
 
 void Viewer::drawParticles(const glm::vec2 & invSize) {
-	_renderer.drawParticles(_scene, _timer, invSize, _state.particles, false);
+	_renderer.drawParticles(_scene, _timer, invSize, _state.particles, Quality::availables.at(_state.quality).finalResolution, false);
 }
 
 void Viewer::drawScore(const glm::vec2 & invSize) {
@@ -380,254 +408,61 @@ void Viewer::drawWaves(const glm::vec2 & invSize){
 	_renderer.drawWaves(_scene, _timer, invSize, _state.waves, _state.keyboard.size);
 }
 
-SystemAction Viewer::drawGUI(const float currentTime) {
+SystemAction Viewer::drawGUI(const double currentTime) {
 
 	SystemAction action = SystemAction::NONE;
 
-	if (ImGui::Begin("Settings", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+	// Apply the scale requested by the corner grip before laying anything out.
+	if(_pendingGuiScale > 0.0f){
+		setGUIScale(_pendingGuiScale);
+		_pendingGuiScale = 0.0f;
+	}
 
-		action = showTopButtons(currentTime);
-		ImGui::Separator();
+	// Fixed width so that the panel does not jump between tabs, and capped to the
+	// window height (it scrolls beyond that) so that it never runs off screen.
+	const ImVec2 & displaySize = ImGui::GetIO().DisplaySize;
+	const float panelMargin = 10.0f;
+	// Leave room for the scrollbar when there is one, the grid would be clipped otherwise.
+	const float scrollbarWidth = _panelScrolls ? ImGui::GetStyle().ScrollbarSize : 0.0f;
+	const float panelWidth = (std::min)(_guiScale * float(PANEL_WIDTH) + scrollbarWidth, displaySize.x);
+	const float panelMaxHeight = (std::max)(displaySize.y - 2.0f * panelMargin, 100.0f);
+	ImGui::SetNextWindowPos(ImVec2(panelMargin, panelMargin), ImGuiCond_FirstUseEver);
+	ImGui::SetNextWindowSizeConstraints(ImVec2(panelWidth, 0.0f), ImVec2(panelWidth, panelMaxHeight));
 
-		// Detail text.
-		const int nCount = _scene->notesCount();
-		const double duration = _scene->duration();
-		const int speed = int(std::round(double(nCount)/(std::max)(0.001, duration)));
-		ImGui::Text("Time: %.2f, notes: %d, duration: %.1fs, speed: %d notes/s", _timer * _state.scrollSpeed, nCount, duration, speed);
+	if (ImGui::Begin("Settings", NULL, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar)) {
+		ImGui::paperBackground();
+		_panelScrolls = ImGui::GetScrollMaxY() > 0.0f;
 
-		ImGui::Separator();
-		
-		// Load button.
-		if(ImGui::Button("Load MIDI file...")) {
-			// Read arguments.
-			char* outPath = nullptr;
-			int res = sr_gui_ask_load_file("Load MIDI file", "", "mid", &outPath);
-			System::forceLocale();
-			if(res == SR_GUI_VALIDATED && outPath){
-				loadFile(std::string(outPath));
+		showTopButtons(currentTime);
+		showStatusLine();
+		ImGui::Spacing();
+
+		if(ImGui::BeginTabBar("##SettingsTabs")){
+			if(beginTab("Session")){
+				showSessionTab();
+				ImGui::EndTabItem();
 			}
-			free(outPath);
-		}
-		ImGuiSameLine(COLUMN_SIZE);
-		if(_liveplay){
-			if (ImGui::Button("Clear and stop session")) {
-				_scene = std::make_shared<MIDIScene>();
-				_liveplay = false;
-				_shouldPlay = false;
-				_timer = 0.0f;
-				applyAllSettings();
+			if(beginTab("Playback")){
+				showPlaybackTab();
+				ImGui::EndTabItem();
 			}
-		} else {
-			if (ImGui::Button("Connect to device...")) {
-				ImGui::OpenPopup("Devices");
+			if(beginTab("Scene")){
+				showSceneTab();
+				ImGui::EndTabItem();
 			}
-			showDevices();
-		}
-
-		const bool existingScene = (std::dynamic_pointer_cast<MIDISceneFile>(_scene) != nullptr)
-								|| (std::dynamic_pointer_cast<MIDISceneLive>(_scene) != nullptr);
-		if(existingScene)
-		{
-			if(ImGui::Button("Export MIDI file...")) {
-				char* savePath = nullptr;
-				int res = sr_gui_ask_save_file("Save MIDI file", "", "mid", &savePath);
-				System::forceLocale();
-				if(res == SR_GUI_VALIDATED && savePath){
-					std::ofstream outFile = System::openOutputFile(std::string(savePath), true);
-					_scene->save(outFile);
-					outFile.close();
+			if(beginTab("Effects")){
+				showEffectsTab();
+				ImGui::EndTabItem();
+			}
+			if(beginTab("Display")){
+				const SystemAction displayAction = showDisplayTab();
+				if(displayAction.type != SystemAction::NONE){
+					action = displayAction;
 				}
-				free(savePath);
+				ImGui::EndTabItem();
 			}
-			ImGui::helpTooltip("Export a new MIDI file of the current session");
+			ImGui::EndTabBar();
 		}
-
-		ImGui::Separator();
-
-		ImGuiPushItemWidth(100);
-		if (ImGui::Combo("Quality", (int *)(&_state.quality), "Half\0Low\0Medium\0High\0Double\0\0")) {
-			updateSizes();
-		}
-		ImGui::helpTooltip(s_quality_dsc);
-		ImGui::PopItemWidth();
-
-		// Add FXAA.
-		ImGuiSameLine(COLUMN_SIZE);
-		ImGui::Checkbox("Smoothing", &_state.applyAA);
-		ImGui::helpTooltip(s_smooth_dsc);
-
-		if (ImGui::Button("Show effect layers...")) {
-			_showLayers = true;
-		}
-		ImGui::helpTooltip("Define which effects are visible and their ordering");
-
-		if(_liveplay){
-			ImGui::BeginDisabled();
-		}
-
-		ImGuiSameLine(COLUMN_SIZE);
-		if (ImGui::Button("Tracks & channels visibility...")) {
-			ImGui::OpenPopup("Visibility options");
-		}
-		ImGui::helpTooltip("Define which tracks and channels are visible");
-		showVisibility();
-
-		if(_liveplay){
-			ImGui::EndDisabled();
-			if(ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)){
-				ImGui::SetTooltip("Not available in liveplay");
-			}
-		}
-
-		if(ImGui::Checkbox("Per-set colors", &_state.perSetColors)){
-			if(!_state.perSetColors){
-				_state.synchronizeSets();
-			}
-		}
-		ImGui::helpTooltip(s_colors_per_set_dsc);
-
-		if(_state.perSetColors){
-			ImGuiSameLine(COLUMN_SIZE);
-			if(ImGui::Button("Define color sets...")){
-				ImGui::OpenPopup("Note sets options");
-			}
-			ImGui::helpTooltip("Define how notes should be assigned to color sets");
-			showSets();
-		}
-
-		if (ImGui::Checkbox("Same colors for all effects", &_state.lockParticleColor)) {
-			// If we enable the lock, make sure the colors are synched.
-			synchronizeColors(_state.notes.majorColors);
-		}
-		ImGui::helpTooltip(s_lock_colors_dsc);
-
-		if(ImGui::CollapsingHeader("Playback##HEADER")){
-			ImGuiPushItemWidth(100);
-			if(ImGui::Combo("Min key", &_state.minKey, midiKeysStrings, 128)){
-				updateMinMaxKeys();
-			}
-			ImGui::helpTooltip(s_min_key_dsc);
-
-			ImGuiSameLine(COLUMN_SIZE);
-			if(ImGui::Combo("Max key", &_state.maxKey, midiKeysStrings, 128)){
-				updateMinMaxKeys();
-			}
-			ImGui::helpTooltip(s_max_key_dsc);
-
-			if (ImGui::InputFloat("Preroll", &_state.prerollTime, 0.1f, 1.0f, "%.1fs")) {
-				reset();
-			}
-			ImGui::helpTooltip(s_preroll_dsc);
-
-			if(_liveplay){
-				ImGui::BeginDisabled();
-			}
-			ImGuiSameLine(COLUMN_SIZE);
-			if(ImGui::SliderFloat("Speed", &_state.scrollSpeed, 0.1f, 5.0f, "%.1fx")){
-				_state.scrollSpeed = (std::max)(0.01f, _state.scrollSpeed);
-			}
-			if(_liveplay){
-				ImGui::EndDisabled();
-				if(ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)){
-					ImGui::SetTooltip("Not available in liveplay");
-				}
-			} else {
-				ImGui::helpTooltip(s_scroll_speed_dsc);
-			}
-			ImGui::PopItemWidth();
-
-			if(ImGui::Checkbox("Horizontal scroll", &_state.horizontalScroll)){
-				_renderer.setOrientation(_state.horizontalScroll);
-			}
-			ImGui::helpTooltip(s_scroll_horizontal_dsc);
-
-			if(_liveplay){
-				ImGui::BeginDisabled();
-			}
-			ImGuiSameLine(COLUMN_SIZE);
-			ImGui::Checkbox("Reverse scroll", &_state.reverseScroll);
-			if(_liveplay){
-				ImGui::EndDisabled();
-				if(ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)){
-					ImGui::SetTooltip("Not available in liveplay");
-				}
-			} else {
-				ImGui::helpTooltip(s_scroll_reverse_dsc);
-			}
-
-			// MIDI output: send playback events to a virtual port so an external
-			// sound engine (e.g. Pianoteq via the macOS IAC Driver) can play in sync.
-			if(!_liveplay){
-				auto fileScene = std::dynamic_pointer_cast<MIDISceneFile>(_scene);
-				if(fileScene){
-					ImGui::Separator();
-					ImGui::TextUnformatted("MIDI output (drives external piano VSTs):");
-					const std::string currentName = fileScene->midiOutputPortName();
-					const char * previewLabel = currentName.empty() ? "Disabled" : currentName.c_str();
-					ImGuiPushItemWidth(260);
-					if(ImGui::BeginCombo("##midi_out_combo", previewLabel)){
-						// Use cached list - the Refresh button forces a re-scan.
-						const auto & ports = MIDISceneFile::availableOutputPorts(false);
-						if(ImGui::Selectable("Disabled", currentName.empty())){
-							fileScene->setMidiOutputByName("");
-						}
-						for(const auto & name : ports){
-							const bool sel = (name == currentName);
-							if(ImGui::Selectable(name.c_str(), sel)){
-								fileScene->setMidiOutputByName(name);
-							}
-						}
-						ImGui::EndCombo();
-					}
-					ImGui::PopItemWidth();
-					ImGuiSameLine();
-					if(ImGui::SmallButton("Refresh##midi_out")){
-						MIDISceneFile::availableOutputPorts(true);
-					}
-					ImGui::helpTooltip("Send note on/off events to an external app. On macOS, enable IAC Driver in Audio MIDI Setup, then select it here.");
-				}
-			}
-
-		}
-
-		if(ImGui::CollapsingHeader("Notes##HEADER")){
-			showNoteOptions();
-		}
-
-		if (_state.showFlashes && ImGui::CollapsingHeader("Flashes##HEADER")) {
-			showFlashOptions();
-		}
-
-		if (_state.showParticles && ImGui::CollapsingHeader("Particles##HEADER")) {
-			showParticleOptions();
-		}
-
-		if (_state.showKeyboard && ImGui::CollapsingHeader("Keyboard##HEADER")) {
-			showKeyboardOptions();
-		}
-
-		if(_state.showPedal && ImGui::CollapsingHeader("Pedal##HEADER")){
-			showPedalOptions();
-		}
-
-		if(_state.showWave && ImGui::CollapsingHeader("Wave##HEADER")){
-			showWaveOptions();
-		}
-
-		if (_state.showScore && ImGui::CollapsingHeader("Score##HEADER")) {
-			showScoreOptions();
-		}
-
-		if (_state.showBlur && ImGui::CollapsingHeader("Blur##HEADER")) {
-			showBlurOptions();
-		}
-
-		if (ImGui::CollapsingHeader("Background##HEADER")) {
-			showBackgroundOptions();
-		}
-		ImGui::Separator();
-
-		showBottomButtons();
 
 		if (_showDebug) {
 			ImGui::Separator();
@@ -660,6 +495,8 @@ SystemAction Viewer::drawGUI(const float currentTime) {
 				synchronizeColors(debugColors);
 			}
 		}
+
+		panelResizeGrip();
 	}
 	ImGui::End();
 
@@ -687,19 +524,22 @@ SystemAction Viewer::drawGUI(const float currentTime) {
 		}
 
 		if(ImGui::BeginPopupModal("Quit", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove)){
+			ImGui::paperBackground();
 			ImGui::Text("Are you sure you want to quit?");
 			const ImVec2 buttonSize(_guiScale * (COLUMN_SIZE - 20.0f), 0.0f);
 			if(ImGui::Button("No", buttonSize)){
 				_shouldQuit = 0;
 			}
 			ImGuiSameLine(COLUMN_SIZE);
-			ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.1f, 0.1f, 1.0f));
+			ImGui::PushStyleColor(ImGuiCol_Button, ImGui::dangerColor());
+			ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImGui::dangerColor());
+			ImGui::PushStyleColor(ImGuiCol_Text, ImGui::onDarkTextColor());
 			if(ImGui::Button("Yes", buttonSize)){
-				ImGui::PopStyleColor();
+				ImGui::PopStyleColor(3);
 				ImGui::EndPopup();
 				return SystemAction::QUIT;
 			}
-			ImGui::PopStyleColor();
+			ImGui::PopStyleColor(3);
 			ImGui::EndPopup();
 		}
 	}
@@ -723,73 +563,535 @@ void Viewer::synchronizeColors(const ColorArray & colors){
 	//}
 }
 
-SystemAction Viewer::showTopButtons(double currentTime){
-	if (ImGui::Button(_shouldPlay ? "Pause (p)" : "Play (p)")) {
+bool Viewer::beginTab(const char* label){
+	// The selected tab is a dark block, its label needs a light color.
+	const bool wasSelected = _selectedTab == label;
+	if(wasSelected){
+		ImGui::PushStyleColor(ImGuiCol_Text, ImGui::onDarkTextColor());
+		ImGui::PushStyleColor(ImGuiCol_TabHovered, ImGui::darkHoverColor());
+	}
+	const bool selected = ImGui::BeginTabItem(label);
+	if(wasSelected){
+		ImGui::PopStyleColor(2);
+	}
+	if(!selected){
+		return false;
+	}
+	_selectedTab = label;
+	ImGui::Spacing();
+	return true;
+}
+
+void Viewer::ornamentTitle(const char* label, const ImVec2& rowMin, const ImVec2& rowMax){
+	// Engraved title: spaced capitals between two diamonds, with thin rules out to the edges of the row.
+	ImFont* font = ImGui::smallFont();
+	const float fontSize = font->FontSize * ImGui::GetIO().FontGlobalScale;
+	const float tracking = 0.16f * fontSize;
+	const float diamond = 0.24f * fontSize;
+	const float gap = 0.55f * fontSize;
+
+	// The label stops at the ID separator.
+	std::string title;
+	for(const char* c = label; *c != '\0' && !(c[0] == '#' && c[1] == '#'); ++c){
+		title.push_back(char(std::toupper((unsigned char)(*c))));
+	}
+
+	float titleWidth = 0.0f;
+	for(size_t cid = 0; cid < title.size(); ++cid){
+		titleWidth += font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, &title[cid], &title[cid] + 1).x;
+	}
+	titleWidth += tracking * float((std::max)(int(title.size()) - 1, 0));
+
+	const ImU32 inkColor = ImGui::GetColorU32(ImGuiCol_Text);
+	const ImU32 ruleColor = ImGui::GetColorU32(ImGuiCol_Separator);
+	ImDrawList* drawList = ImGui::GetWindowDrawList();
+
+	const float centerY = std::floor(0.5f * (rowMin.y + rowMax.y)) + 0.5f;
+	const float titleMin = std::floor(0.5f * (rowMin.x + rowMax.x) - 0.5f * titleWidth);
+	const float titleMax = titleMin + titleWidth;
+
+	ImVec2 cursor(titleMin, centerY - 0.5f * fontSize);
+	for(size_t cid = 0; cid < title.size(); ++cid){
+		drawList->AddText(font, fontSize, cursor, inkColor, &title[cid], &title[cid] + 1);
+		cursor.x += font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, &title[cid], &title[cid] + 1).x + tracking;
+	}
+
+	const float diamondLeft = titleMin - gap - diamond;
+	const float diamondRight = titleMax + gap + diamond;
+	for(const float x : {diamondLeft, diamondRight}){
+		drawList->AddQuadFilled(ImVec2(x - diamond, centerY), ImVec2(x, centerY - diamond), ImVec2(x + diamond, centerY), ImVec2(x, centerY + diamond), inkColor);
+	}
+
+	const float ruleLeftEnd = diamondLeft - diamond - gap;
+	const float ruleRightStart = diamondRight + diamond + gap;
+	if(ruleLeftEnd > rowMin.x){
+		drawList->AddLine(ImVec2(rowMin.x, centerY), ImVec2(ruleLeftEnd, centerY), ruleColor, 1.0f);
+	}
+	if(ruleRightStart < rowMax.x){
+		drawList->AddLine(ImVec2(ruleRightStart, centerY), ImVec2(rowMax.x, centerY), ruleColor, 1.0f);
+	}
+}
+
+void Viewer::panelResizeGrip(){
+	ImGuiWindow* window = ImGui::GetCurrentWindow();
+	const ImGuiIO & io = ImGui::GetIO();
+	const ImGuiStyle & style = ImGui::GetStyle();
+
+	// Bottom right corner, next to the scrollbar when there is one.
+	const float scrollbarWidth = _panelScrolls ? style.ScrollbarSize : 0.0f;
+	const ImVec2 winMin = window->Pos;
+	const ImVec2 winMax(window->Pos.x + window->Size.x, window->Pos.y + window->Size.y);
+	const float gripSize = (std::max)(18.0f * _guiScale, 14.0f);
+	const ImVec2 gripMax(winMax.x - scrollbarWidth, winMax.y);
+	const ImRect gripRect(ImVec2(gripMax.x - gripSize, gripMax.y - gripSize), gripMax);
+	const ImGuiID gripId = window->GetID("##panelResize");
+
+	// The grip sits in the padding of the window: register it without going through the layout
+	// (it would grow the panel), and lift the content clipping so that all of it reacts.
+	ImGui::PushClipRect(winMin, winMax, false);
+	bool hovered = false;
+	bool held = false;
+	if(ImGui::ItemAdd(gripRect, gripId)){
+		ImGui::ButtonBehavior(gripRect, gripId, &hovered, &held);
+	}
+
+	if(held){
+		if(!_resizingPanel){
+			_resizingPanel = true;
+			_resizeGrabOffset = winMax.x - io.MousePos.x;
+		}
+		// The panel width is PANEL_WIDTH (plus the scrollbar) times the scale: find the scale
+		// putting the right edge back under the cursor, the top left corner does not move.
+		const float baseWidth = float(PANEL_WIDTH) + scrollbarWidth / _guiScale;
+		const float wantedWidth = io.MousePos.x + _resizeGrabOffset - winMin.x;
+		const float maxScale = (std::max)(0.5f, (std::min)(3.0f, io.DisplaySize.x / baseWidth));
+		const float scale = std::round(glm::clamp(wantedWidth / baseWidth, 0.5f, maxScale) * 100.0f) / 100.0f;
+		if(std::abs(scale - _guiScale) > 0.004f){
+			_pendingGuiScale = scale;
+		}
+	} else {
+		_resizingPanel = false;
+	}
+
+	if(hovered || held){
+		ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNWSE);
+		if(!held){
+			ImGui::SetTooltip("Drag to resize the panel");
+		}
+	}
+
+	// Three diagonal lines, inside the rim.
+	ImVec4 gripColor = style.Colors[ImGuiCol_Text];
+	gripColor.w = (hovered || held) ? 0.9f : 0.45f;
+	const ImU32 gripColorU32 = ImGui::GetColorU32(gripColor);
+	const float unit = _guiScale;
+	const float inset = 7.5f * unit;
+	ImDrawList* drawList = ImGui::GetWindowDrawList();
+	for(int lid = 1; lid <= 3; ++lid){
+		const float reach = (1.5f + 3.5f * float(lid)) * unit;
+		drawList->AddLine(ImVec2(gripMax.x - inset - reach, gripMax.y - inset), ImVec2(gripMax.x - inset, gripMax.y - inset - reach), gripColorU32, (std::max)(1.0f, 1.2f * unit));
+	}
+	ImGui::PopClipRect();
+}
+
+void Viewer::sectionTitle(const char* label){
+	ImGui::Spacing();
+	const ImVec2 rowMin = ImGui::GetCursorScreenPos();
+	const ImVec2 rowSize(ImGui::GetContentRegionAvail().x, ImGui::GetTextLineHeight());
+	ImGui::Dummy(rowSize);
+	ornamentTitle(label, rowMin, ImVec2(rowMin.x + rowSize.x, rowMin.y + rowSize.y));
+}
+
+bool Viewer::gridButton(const char* label){
+	// Buttons filling one column of the grid, so that rows of actions line up.
+	return ImGui::Button(label, ImVec2(_guiScale * float(COLUMN_SIZE - 24), 0.0f));
+}
+
+bool Viewer::layerSection(const char* label, bool& enabled){
+	ImGui::PushID(label);
+	ImGui::Checkbox("##enabled", &enabled);
+	ImGui::helpTooltip("Show or hide this layer");
+	ImGui::SameLine();
+
+	// The rest of the row is the title, clicking it folds or unfolds the section.
+	ImGuiStorage* storage = ImGui::GetStateStorage();
+	const ImGuiID openId = ImGui::GetID("##open");
+	bool open = storage->GetBool(openId, false);
+
+	const ImVec2 rowMin = ImGui::GetCursorScreenPos();
+	const ImVec2 rowSize(ImGui::GetContentRegionAvail().x, ImGui::GetFrameHeight());
+	const ImVec2 rowMax(rowMin.x + rowSize.x, rowMin.y + rowSize.y);
+	if(ImGui::InvisibleButton("##title", rowSize)){
+		open = !open;
+		storage->SetBool(openId, open);
+	}
+	ImDrawList* drawList = ImGui::GetWindowDrawList();
+	if(ImGui::IsItemHovered()){
+		drawList->AddRectFilled(rowMin, rowMax, ImGui::GetColorU32(ImGuiCol_HeaderHovered), ImGui::GetStyle().FrameRounding);
+	}
+	// Fold mark on the left.
+	const float arrow = 0.28f * ImGui::GetFontSize();
+	const ImVec2 arrowCenter(std::floor(rowMin.x + 2.0f * arrow) + 0.5f, std::floor(0.5f * (rowMin.y + rowMax.y)) + 0.5f);
+	const ImU32 inkColor = ImGui::GetColorU32(ImGuiCol_Text);
+	if(open){
+		drawList->AddTriangleFilled(ImVec2(arrowCenter.x - arrow, arrowCenter.y - 0.7f * arrow), ImVec2(arrowCenter.x + arrow, arrowCenter.y - 0.7f * arrow), ImVec2(arrowCenter.x, arrowCenter.y + 0.9f * arrow), inkColor);
+	} else {
+		drawList->AddTriangleFilled(ImVec2(arrowCenter.x - 0.7f * arrow, arrowCenter.y - arrow), ImVec2(arrowCenter.x + 0.9f * arrow, arrowCenter.y), ImVec2(arrowCenter.x - 0.7f * arrow, arrowCenter.y + arrow), inkColor);
+	}
+	ornamentTitle(label, ImVec2(rowMin.x + 5.0f * arrow, rowMin.y), ImVec2(rowMax.x - 2.0f * arrow, rowMax.y));
+
+	ImGui::PopID();
+	return open;
+}
+
+void Viewer::showStatusLine(){
+	const double time = _timer * _state.scrollSpeed;
+	const int nCount = _scene->notesCount();
+
+	ImGui::PushFont(ImGui::smallFont());
+	if(auto liveScene = std::dynamic_pointer_cast<MIDISceneLive>(_scene)){
+		ImGui::TextDisabled("Live on %s, %.1fs, %d notes", liveScene->deviceName().c_str(), time, nCount);
+	} else if(std::dynamic_pointer_cast<MIDISceneFile>(_scene)){
+		const double duration = _scene->duration();
+		const int speed = int(std::round(double(nCount)/(std::max)(0.001, duration)));
+		ImGui::TextDisabled("%.1fs of %.1fs, %d notes, %d per second", time, duration, nCount, speed);
+	} else {
+		ImGui::TextDisabled("Load a MIDI file or connect a device to start.");
+	}
+	ImGui::PopFont();
+}
+
+void Viewer::showSessionTab(){
+	if(gridButton("Load MIDI file...")) {
+		// Read arguments.
+		char* outPath = nullptr;
+		int res = sr_gui_ask_load_file("Load MIDI file", "", "mid", &outPath);
+		System::forceLocale();
+		if(res == SR_GUI_VALIDATED && outPath){
+			loadFile(std::string(outPath));
+		}
+		free(outPath);
+	}
+	ImGuiSameLine(COLUMN_SIZE);
+	if(_liveplay){
+		if (gridButton("End session")) {
+			_scene = std::make_shared<MIDIScene>();
+			_liveplay = false;
+			_shouldPlay = false;
+			_timer = 0.0;
+			applyAllSettings();
+		}
+		ImGui::helpTooltip("Disconnect from the device and clear the recorded notes");
+	} else {
+		if (gridButton("Connect to device...")) {
+			ImGui::OpenPopup("Devices");
+		}
+		showDevices();
+	}
+
+	const bool existingScene = (std::dynamic_pointer_cast<MIDISceneFile>(_scene) != nullptr)
+							|| (std::dynamic_pointer_cast<MIDISceneLive>(_scene) != nullptr);
+	if(existingScene){
+		if(gridButton("Export MIDI file...")) {
+			char* savePath = nullptr;
+			int res = sr_gui_ask_save_file("Save MIDI file", "", "mid", &savePath);
+			System::forceLocale();
+			if(res == SR_GUI_VALIDATED && savePath){
+				std::ofstream outFile = System::openOutputFile(std::string(savePath), true);
+				_scene->save(outFile);
+				outFile.close();
+			}
+			free(savePath);
+		}
+		ImGui::helpTooltip("Export a new MIDI file of the current session");
+	}
+	if(_liveplay){
+		if(existingScene){
+			ImGuiSameLine(COLUMN_SIZE);
+		}
+		if (gridButton("Reset stuck notes")) {
+			if(auto ls = std::dynamic_pointer_cast<MIDISceneLive>(_scene)) ls->resetStuckNotes();
+		}
+		ImGui::helpTooltip("Force-close any note stuck on screen (a note whose\nnote-off was lost), without reconnecting the device.\nShortcut: K");
+	}
+
+	// MIDI output: send playback events to a virtual port so an external
+	// sound engine (e.g. Pianoteq via the macOS IAC Driver) can play in sync.
+	if(auto fileScene = std::dynamic_pointer_cast<MIDISceneFile>(_scene)){
+		sectionTitle("MIDI output");
+		const std::string currentName = fileScene->midiOutputPortName();
+		const char * previewLabel = currentName.empty() ? "Disabled" : currentName.c_str();
+		const ImGuiStyle & style = ImGui::GetStyle();
+		const float refreshWidth = ImGui::CalcTextSize("Refresh").x + 2.0f * style.FramePadding.x;
+		ImGui::PushItemWidth(-(refreshWidth + style.ItemSpacing.x));
+		if(ImGui::BeginCombo("##midi_out_combo", previewLabel)){
+			// Use cached list - the Refresh button forces a re-scan.
+			const auto & ports = MIDISceneFile::availableOutputPorts(false);
+			if(ImGui::Selectable("Disabled", currentName.empty())){
+				fileScene->setMidiOutputByName("");
+				_midiOutputName.clear();
+			}
+			for(const auto & name : ports){
+				const bool sel = (name == currentName);
+				if(ImGui::Selectable(name.c_str(), sel)){
+					fileScene->setMidiOutputByName(name);
+					_midiOutputName = name;
+				}
+			}
+			ImGui::EndCombo();
+		}
+		ImGui::PopItemWidth();
+		ImGuiSameLine();
+		if(ImGui::Button("Refresh##midi_out")){
+			MIDISceneFile::availableOutputPorts(true);
+		}
+		ImGui::helpTooltip("Send note on/off events to an external app. On macOS, enable IAC Driver in Audio MIDI Setup, then select it here.");
+	}
+
+	sectionTitle("Settings and video");
+	showBottomButtons();
+}
+
+void Viewer::showPlaybackTab(){
+	ImGuiPushItemWidth(ITEM_WIDTH);
+	if(ImGui::Combo("Min key", &_state.minKey, midiKeysStrings, 128)){
+		updateMinMaxKeys();
+	}
+	ImGui::helpTooltip(s_min_key_dsc);
+
+	ImGuiSameLine(COLUMN_SIZE);
+	if(ImGui::Combo("Max key", &_state.maxKey, midiKeysStrings, 128)){
+		updateMinMaxKeys();
+	}
+	ImGui::helpTooltip(s_max_key_dsc);
+
+	if (ImGui::InputFloat("Preroll", &_state.prerollTime, 0.1f, 1.0f, "%.1fs")) {
+		reset();
+	}
+	ImGui::helpTooltip(s_preroll_dsc);
+
+	if(_liveplay){
+		ImGui::BeginDisabled();
+	}
+	ImGuiSameLine(COLUMN_SIZE);
+	if(ImGui::InputFloat("Speed", &_state.scrollSpeed, 0.1f, 0.5f, "%.1fx")){
+		_state.scrollSpeed = (std::max)(0.1f, (std::min)(5.0f, _state.scrollSpeed));
+	}
+	if(_liveplay){
+		ImGui::EndDisabled();
+		if(ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)){
+			ImGui::SetTooltip("Not available in liveplay");
+		}
+	} else {
+		ImGui::helpTooltip(s_scroll_speed_dsc);
+	}
+
+	// Visual transpose in semitones (display only). Set this to the same
+	// value as Pianoteq's transpose so the on-screen notes match the sound.
+	if(ImGui::InputInt("Transpose", &_state.transpose)){
+		_state.transpose = (std::max)(-24, (std::min)(24, _state.transpose));
+		_scene->setTranspose(_state.transpose);
+		_scene->updateVisibleNotes(_state.filter);
+	}
+	ImGui::helpTooltip(s_transpose_dsc);
+	ImGui::PopItemWidth();
+
+	if(_liveplay){
+		ImGui::BeginDisabled();
+	}
+	ImGuiSameLine(COLUMN_SIZE);
+	if (gridButton("Tracks and channels...")) {
+		ImGui::OpenPopup("Visibility options");
+	}
+	ImGui::helpTooltip("Define which tracks and channels are visible");
+	showVisibility();
+	if(_liveplay){
+		ImGui::EndDisabled();
+		if(ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)){
+			ImGui::SetTooltip("Not available in liveplay");
+		}
+	}
+
+	if(ImGui::Checkbox("Horizontal scroll", &_state.horizontalScroll)){
+		_renderer.setOrientation(_state.horizontalScroll);
+	}
+	ImGui::helpTooltip(s_scroll_horizontal_dsc);
+
+	if(_liveplay){
+		ImGui::BeginDisabled();
+	}
+	ImGuiSameLine(COLUMN_SIZE);
+	ImGui::Checkbox("Reverse scroll", &_state.reverseScroll);
+	if(_liveplay){
+		ImGui::EndDisabled();
+		if(ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)){
+			ImGui::SetTooltip("Not available in liveplay");
+		}
+	} else {
+		ImGui::helpTooltip(s_scroll_reverse_dsc);
+	}
+}
+
+void Viewer::showSceneTab(){
+	if(ImGui::Checkbox("Per-set colors", &_state.perSetColors)){
+		if(!_state.perSetColors){
+			_state.synchronizeSets();
+		}
+	}
+	ImGui::helpTooltip(s_colors_per_set_dsc);
+
+	if(_state.perSetColors){
+		ImGuiSameLine(COLUMN_SIZE);
+		if(gridButton("Define color sets...")){
+			ImGui::OpenPopup("Note sets options");
+		}
+		ImGui::helpTooltip("Define how notes should be assigned to color sets");
+		showSets();
+	}
+
+	if (ImGui::Checkbox("Same colors for all effects", &_state.lockParticleColor)) {
+		// If we enable the lock, make sure the colors are synched.
+		synchronizeColors(_state.notes.majorColors);
+	}
+	ImGui::helpTooltip(s_lock_colors_dsc);
+
+	ImGui::Spacing();
+
+	if(layerSection("Notes##HEADER", _state.showNotes)){
+		ImGui::BeginDisabled(!_state.showNotes);
+		showNoteOptions();
+		ImGui::EndDisabled();
+	}
+	if(layerSection("Keyboard##HEADER", _state.showKeyboard)){
+		ImGui::BeginDisabled(!_state.showKeyboard);
+		showKeyboardOptions();
+		ImGui::EndDisabled();
+	}
+	if(layerSection("Background image##HEADER", _state.background.image)){
+		showBackgroundOptions();
+	}
+}
+
+void Viewer::showEffectsTab(){
+	if(layerSection("Flashes##HEADER", _state.showFlashes)){
+		ImGui::BeginDisabled(!_state.showFlashes);
+		showFlashOptions();
+		ImGui::EndDisabled();
+	}
+	if(layerSection("Particles##HEADER", _state.showParticles)){
+		ImGui::BeginDisabled(!_state.showParticles);
+		showParticleOptions();
+		ImGui::EndDisabled();
+	}
+	if(layerSection("Pedal##HEADER", _state.showPedal)){
+		ImGui::BeginDisabled(!_state.showPedal);
+		showPedalOptions();
+		ImGui::EndDisabled();
+	}
+	if(layerSection("Wave##HEADER", _state.showWave)){
+		ImGui::BeginDisabled(!_state.showWave);
+		showWaveOptions();
+		ImGui::EndDisabled();
+	}
+	if(layerSection("Score##HEADER", _state.showScore)){
+		ImGui::BeginDisabled(!_state.showScore);
+		showScoreOptions();
+		ImGui::EndDisabled();
+	}
+	if(layerSection("Blur##HEADER", _state.showBlur)){
+		ImGui::BeginDisabled(!_state.showBlur);
+		showBlurOptions();
+		ImGui::EndDisabled();
+	}
+
+	ImGui::Spacing();
+	if (gridButton("Reorder layers...")) {
+		_showLayers = true;
+	}
+	ImGui::helpTooltip("Define which effects are visible and their ordering");
+}
+
+SystemAction Viewer::showDisplayTab(){
+	SystemAction action = SystemAction::NONE;
+
+	ImGuiPushItemWidth(ITEM_WIDTH);
+	if (ImGui::Combo("Quality", (int *)(&_state.quality), "Half\0Low\0Medium\0High\0Double\0\0")) {
+		updateSizes();
+	}
+	ImGui::helpTooltip(s_quality_dsc);
+	ImGui::PopItemWidth();
+
+	// Add FXAA.
+	ImGuiSameLine(COLUMN_SIZE);
+	ImGui::Checkbox("Smoothing", &_state.applyAA);
+	ImGui::helpTooltip(s_smooth_dsc);
+
+	ImGuiPushItemWidth(ITEM_WIDTH);
+	if(ImGui::InputFloat("GUI size", &_guiScale, 0.25f, 1.0f, "%.2fx")){
+		_guiScale = glm::clamp(_guiScale, 0.25f, 4.0f);
+		setGUIScale(_guiScale);
+	}
+	ImGui::helpTooltip("Scale of the interface texts and buttons on screen");
+	ImGui::PopItemWidth();
+	ImGuiSameLine(COLUMN_SIZE);
+	if(ImGui::Button("Reset GUI size")){
+		setGUIScale(1.0f);
+	}
+	ImGui::helpTooltip("Reset the scale of the interface to 1x");
+
+	if(ImGui::Checkbox("Fullscreen", &_fullscreen)){
+		action = SystemAction::FULLSCREEN;
+	}
+	ImGui::helpTooltip("Toggle fullscreen window");
+
+	if(_supportTransparency) {
+		ImGuiSameLine(COLUMN_SIZE);
+		if(ImGui::Checkbox("Transparent", &_useTransparency)){
+			_useTransparency = _useTransparency && _supportTransparency;
+		}
+		ImGui::helpTooltip("Toggle background window transparency");
+	}
+
+	if(!_fullscreen){
+		ImGuiPushItemWidth(ITEM_WIDTH);
+		ImGui::InputInt2("Window size", &_windowSize[0]);
+		ImGui::PopItemWidth();
+		ImGuiSameLine(COLUMN_SIZE);
+		if(ImGui::Button("Resize window")){
+			action = SystemAction::RESIZE;
+			action.data[0] = _windowSize[0];
+			action.data[1] = _windowSize[1];
+		}
+		ImGui::helpTooltip("Apply the specified size to the window");
+	}
+
+	return action;
+}
+
+void Viewer::showTopButtons(double currentTime){
+	const ImVec2 transportSize(_guiScale * 86.0f, 0.0f);
+
+	if (ImGui::Button(_shouldPlay ? "Pause" : "Play", transportSize)) {
 		_shouldPlay = !_shouldPlay;
-		_timerStart = float(currentTime) - _timer;
+		_timerStart = currentTime - _timer;
 		if(!_shouldPlay){
 			if(auto fs = std::dynamic_pointer_cast<MIDISceneFile>(_scene)) fs->silenceAllNotes();
 		}
 	}
+	ImGui::helpTooltip("Shortcut: P");
 	ImGuiSameLine();
-	if (ImGui::Button("Restart (r)")) {
+	if (ImGui::Button("Restart", transportSize)) {
 		reset();
 	}
+	ImGui::helpTooltip("Shortcut: R");
 	ImGuiSameLine();
-	if (ImGui::Button("Hide (i)")) {
+	if (ImGui::Button("Hide", transportSize)) {
 		_showGUI = false;
 	}
-	ImGuiSameLine();
-	if(ImGui::Button("Display")){
-		ImGui::OpenPopup("Display options");
-	}
-	ImGui::helpTooltip("Configure display settings");
+	ImGui::helpTooltip("Press I to show the panel again");
 
-	SystemAction action = SystemAction::NONE;
-	if(ImGui::BeginPopup("Display options")){
-		
-		ImGuiPushItemWidth(100);
-		if(ImGui::InputFloat("GUI size", &_guiScale, 0.25f, 1.0f, "%.2fx")){
-			_guiScale = glm::clamp(_guiScale, 0.25f, 4.0f);
-			setGUIScale(_guiScale);
-		}
-		ImGui::helpTooltip("Scale of the interface texts and buttons on screen");
-		ImGui::PopItemWidth();
-		ImGuiSameLine(EXPORT_COLUMN_SIZE);
-		if(ImGui::Button("Reset##GUI")){
-			setGUIScale(1.0f);
-		}
-		ImGui::helpTooltip("Reset the scale of the interface to 1x");
-
-		if(ImGui::Checkbox("Fullscreen", &_fullscreen)){
-			action = SystemAction::FULLSCREEN;
-		}
-		ImGui::helpTooltip("Toggle fullscreen window");
-
-		if(!_fullscreen){
-			ImGuiPushItemWidth(100);
-			ImGui::InputInt2("Window size", &_windowSize[0]);
-			ImGui::PopItemWidth();
-			ImGuiSameLine(EXPORT_COLUMN_SIZE);
-			if(ImGui::Button("Resize")){
-				action = SystemAction::RESIZE;
-				action.data[0] = _windowSize[0];
-				action.data[1] = _windowSize[1];
-			}
-			ImGui::helpTooltip("Apply the specified size to the window");
-		}
-
-		if(_supportTransparency) {
-			if(ImGui::Checkbox("Transparent", &_useTransparency)){
-				_useTransparency = _useTransparency && _supportTransparency;
-			}
-			ImGui::helpTooltip("Toggle background window transparency");
-		}
-
-		ImGui::EndPopup();
-	}
-
-	ImGuiSameLine(360);
+	// About mark, aligned on the right edge.
+	ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - ImGui::CalcTextSize("(?)").x);
 	ImGui::TextDisabled("(?)");
 	if (ImGui::IsItemHovered()) {
 		ImGui::BeginTooltip();
@@ -804,7 +1106,6 @@ SystemAction Viewer::showTopButtons(double currentTime){
 	if(ImGui::IsItemClicked()){
 		sr_gui_open_in_browser("https://github.com/kosua20/MIDIVisualizer");
 	}
-	return action;
 }
 
 void Viewer::showNoteOptions() {
@@ -827,6 +1128,7 @@ void Viewer::showNoteOptions() {
 	ImGui::helpTooltip("Define background textures for major and minor notes");
 
 	if(ImGui::BeginPopup("Note background textures")){
+		ImGui::paperBackground();
 		struct BackgroundTextureParams {
 			const char* name;
 			std::vector<std::string>& paths;
@@ -851,7 +1153,7 @@ void Viewer::showNoteOptions() {
 			ImGui::PushID(group.name);
 			ImGui::AlignTextToFramePadding();
 			ImGui::Text("%s", group.name);
-			ImGuiSameLine(100);
+			ImGuiSameLine(115);
 			if(ImGui::Button("Load...")){
 				 // Read arguments.
 				 char *outPath = nullptr;
@@ -874,7 +1176,7 @@ void Viewer::showNoteOptions() {
 			ImGui::helpTooltip("Remove the current image");
 			ImGuiSameLine();
 
-			ImGuiPushItemWidth(100);
+			ImGuiPushItemWidth(ITEM_WIDTH);
 			if(ImGui::SliderFloat("Scale", &group.scale, 0.1f, 15.0f, "%.2fx")){
 				group.scale = glm::max(group.scale, 0.001f);
 			}
@@ -897,7 +1199,7 @@ void Viewer::showNoteOptions() {
 	}
 
 
-	ImGuiPushItemWidth(100);
+	ImGuiPushItemWidth(ITEM_WIDTH);
 	bool smw0 = ImGui::InputFloat("Scale", &_state.scale, 0.01f, 0.1f, "%.2fx");
 	ImGui::helpTooltip(s_time_scale_dsc);
 	ImGuiSameLine(COLUMN_SIZE);
@@ -913,7 +1215,7 @@ void Viewer::showNoteOptions() {
 		_renderer.setScaleAndMinorWidth(_state.scale, _state.background.minorsWidth);
 	}
 
-	ImGuiPushItemWidth(100);
+	ImGuiPushItemWidth(ITEM_WIDTH);
 	if(ImGui::SliderFloat("Radius", &_state.notes.cornerRadius, 0.0f, 1.0f)){
 		_state.notes.cornerRadius = glm::clamp(_state.notes.cornerRadius, 0.0f, 1.0f);
 	}
@@ -947,13 +1249,13 @@ void Viewer::showFlashOptions() {
 	ImGui::helpTooltip(s_color_flashes_dsc);
 
 	ImGuiSameLine(COLUMN_SIZE);
-	ImGuiPushItemWidth(100);
+	ImGuiPushItemWidth(ITEM_WIDTH);
 	ImGui::SliderFloat("Scale##flash", &_state.flashes.size, 0.1f, 3.0f, "%.2fx");
 	ImGui::helpTooltip(s_flashes_size_dsc);
 	ImGui::PopItemWidth();
 
 	// Additional halo control
-	ImGuiPushItemWidth(100);
+	ImGuiPushItemWidth(ITEM_WIDTH);
 	if(ImGui::SliderFloat("Halo min", &_state.flashes.haloInnerRadius, 0.0f, 1.0f)){
 		_state.flashes.haloInnerRadius = glm::clamp(_state.flashes.haloInnerRadius, 0.0f, _state.flashes.haloOuterRadius);
 	}
@@ -1024,29 +1326,17 @@ void Viewer::showParticleOptions(){
 
 	ImGuiSameLine(COLUMN_SIZE);
 
-	ImGuiPushItemWidth(100);
-	if (ImGui::InputFloat("Size##particles", &_state.particles.scale, 1.0f, 10.0f, "%.0fpx")) {
-		_state.particles.scale = (std::max)(1.0f, _state.particles.scale);
+	ImGuiPushItemWidth(ITEM_WIDTH);
+	if (ImGui::InputFloat("Size##particles", &_state.particles.scale, 0.1f, 1.0f, "%.1fpx")) {
+		_state.particles.scale = glm::clamp(_state.particles.scale, 0.1f, 10.0f);
 	}
 	ImGui::helpTooltip(s_particles_size_dsc);
-
-	const bool mp0 = ImGui::InputFloat("Speed", &_state.particles.speed, 0.01f, 1.0f, "%.2fx");
-	ImGui::helpTooltip(s_particles_speed_dsc);
-	ImGuiSameLine(COLUMN_SIZE);
-
-	const bool mp1 = ImGui::InputFloat("Spread", &_state.particles.expansion, 0.1f, 5.0f, "%.1fx");
-	ImGui::helpTooltip(s_particles_expansion_dsc);
 
 	if (ImGui::SliderInt("Count", &_state.particles.count, 1, 512)) {
 		_state.particles.count = glm::clamp(_state.particles.count, 1, 512);
 	}
 	ImGui::helpTooltip(s_particles_count_dsc);
 	ImGui::PopItemWidth();
-
-	if (mp1 || mp0) {
-		// TODO: (MV) just apply when needed?
-		_renderer.setParticlesParameters(_state.particles.speed, _state.particles.expansion);
-	}
 
 	ImGuiSameLine(COLUMN_SIZE);
 
@@ -1056,8 +1346,19 @@ void Viewer::showParticleOptions(){
 	}
 	ImGui::helpTooltip("Define images to assign randomly to each particle");
 
-	ImGuiPushItemWidth(100);
-	ImGui::SliderPercent("Turbulences", &_state.particles.turbulenceStrength, 0.01f, 8.0f);
+	ImGuiPushItemWidth(ITEM_WIDTH);
+	if(ImGui::SliderFloat("Float height", &_state.particles.floatHeight, 0.1f, 3.0f, "%.2fx")){
+		_state.particles.floatHeight = glm::clamp(_state.particles.floatHeight, 0.1f, 3.0f);
+	}
+	ImGui::helpTooltip(s_particles_float_height_dsc);
+
+	ImGuiSameLine(COLUMN_SIZE);
+	if(ImGui::SliderFloat("Lifetime", &_state.particles.lifetime, 0.2f, 10.0f, "%.1fs")){
+		_state.particles.lifetime = glm::clamp(_state.particles.lifetime, 0.2f, 10.0f);
+	}
+	ImGui::helpTooltip(s_particles_lifetime_dsc);
+
+	ImGui::SliderPercent("Sway", &_state.particles.sway, 0.0f, 2.0f);
 	ImGui::helpTooltip(s_particles_turbulences_dsc);
 	ImGui::PopItemWidth();
 
@@ -1066,14 +1367,14 @@ void Viewer::showParticleOptions(){
 
 void Viewer::showKeyboardOptions(){
 	ImGuiPushItemWidth(25);
-	ImGui::ColorEdit3("Edge Color##Keys", &_state.keyboard.edgeColor[0], ImGuiColorEditFlags_NoInputs);
+	ImGui::ColorEdit3("Edge color##Keys", &_state.keyboard.edgeColor[0], ImGuiColorEditFlags_NoInputs);
 	ImGui::helpTooltip(s_color_keyboard_dsc);
 	ImGuiSameLine(COLUMN_SIZE);
-	ImGui::ColorEdit3("Fill Color##Keys", &_state.keyboard.backColor[0], ImGuiColorEditFlags_NoInputs);
+	ImGui::ColorEdit3("Fill color##Keys", &_state.keyboard.backColor[0], ImGuiColorEditFlags_NoInputs);
 	ImGui::helpTooltip(s_color_keyboard_bg_dsc);
 	ImGui::PopItemWidth();
 
-	ImGuiPushItemWidth(100);
+	ImGuiPushItemWidth(ITEM_WIDTH);
 	if(ImGui::SliderPercent("Height##Keys", &_state.keyboard.size, 0.0f, 1.0f)){
 		_state.keyboard.size = glm::clamp(_state.keyboard.size, 0.0f, 1.0f);
 		_renderer.setKeyboardSizeAndFadeout(_state.keyboard.size, _state.notes.fadeOut);
@@ -1115,7 +1416,7 @@ void Viewer::showKeyboardOptions(){
 			}
 			ImGui::helpTooltip(s_color_keyboard_major_dsc);
 
-			ImGuiSameLine(COLUMN_SIZE+80);
+			ImGuiSameLine(COLUMN_SIZE+95);
 			if(ImGui::ColorEdit3("Minor##KeysHighlight", &_state.keyboard.minorColor[0][0], ImGuiColorEditFlags_NoInputs)){
 				// Ensure synchronization of the override array.
 				for(size_t cid = 1; cid < _state.keyboard.minorColor.size(); ++cid){
@@ -1139,7 +1440,7 @@ void Viewer::showPedalOptions(){
 	ImGui::helpTooltip(s_color_pedal_dsc);
 	ImGui::PopItemWidth();
 
-	ImGuiPushItemWidth(100);
+	ImGuiPushItemWidth(ITEM_WIDTH);
 	ImGuiSameLine(COLUMN_SIZE);
 	ImGui::Combo("Location", (int*)&_state.pedals.location, "Top left\0Bottom left\0Top right\0Bottom right\0");
 	ImGui::helpTooltip(s_pedal_location_dsc);
@@ -1172,7 +1473,7 @@ void Viewer::showWaveOptions(){
 	ImGui::helpTooltip(s_color_wave_dsc);
 	ImGui::PopItemWidth();
 
-	ImGuiPushItemWidth(100);
+	ImGuiPushItemWidth(ITEM_WIDTH);
 	ImGuiSameLine(COLUMN_SIZE);
 	ImGui::SliderFloat("Amplitude##Waves", &_state.waves.amplitude, 0.0f, 5.0f, "%.2fx");
 	ImGui::helpTooltip(s_wave_amplitude_dsc);
@@ -1205,7 +1506,7 @@ void Viewer::showBlurOptions(){
 	ImGui::helpTooltip(s_show_blur_notes_dsc);
 	ImGuiSameLine(COLUMN_SIZE);
 
-	ImGuiPushItemWidth(100);
+	ImGuiPushItemWidth(ITEM_WIDTH);
 	if (ImGui::SliderFloat("Fading", &_state.attenuation, 0.0f, 1.0f)) {
 		_state.attenuation = glm::clamp(_state.attenuation, 0.0f, 1.0f);
 		_blurringScreen.program().use();
@@ -1233,7 +1534,7 @@ void Viewer::showScoreOptions(){
 	ImGui::Checkbox("Horizontal lines", &_state.score.hLines);
 	ImGui::helpTooltip(s_show_horiz_lines_dsc);
 	ImGuiSameLine(COLUMN_SIZE);
-	ImGuiPushItemWidth(100);
+	ImGuiPushItemWidth(ITEM_WIDTH);
 	ImGui::SliderFloat("Thickness##Horizontal", &_state.score.hLinesWidth, 0.0f, 15.0f, "%.0fpx");
 	ImGui::helpTooltip(s_score_lines_horizontal_width_dsc);
 	ImGui::PopItemWidth();
@@ -1241,7 +1542,7 @@ void Viewer::showScoreOptions(){
 	ImGui::Checkbox("Vertical lines", &_state.score.vLines);
 	ImGui::helpTooltip(s_show_vert_lines_dsc);
 	ImGuiSameLine(COLUMN_SIZE);
-	ImGuiPushItemWidth(100);
+	ImGuiPushItemWidth(ITEM_WIDTH);
 	ImGui::SliderFloat("Thickness##Vertical", &_state.score.vLinesWidth, 0.0f, 15.0f, "%.0fpx");
 	ImGui::helpTooltip(s_score_lines_vertical_width_dsc);
 	ImGui::PopItemWidth();
@@ -1249,12 +1550,12 @@ void Viewer::showScoreOptions(){
 	ImGui::Checkbox("Digits", &_state.score.digits);
 	ImGui::helpTooltip(s_show_numbers_dsc);
 	ImGuiSameLine(COLUMN_SIZE);
-	ImGuiPushItemWidth(100);
+	ImGuiPushItemWidth(ITEM_WIDTH);
 	ImGui::SliderPercent("Scale##Digits", &_state.score.digitsScale, 0.0f, 0.5f);
 	ImGui::helpTooltip(s_score_digits_size_dsc);
 	ImGui::PopItemWidth();
 
-	ImGuiPushItemWidth(100);
+	ImGuiPushItemWidth(ITEM_WIDTH);
 	ImGui::SliderPercent("Offset X##Digits", &_state.score.digitsOffset[0], -1.f, 1.0f);
 	ImGui::helpTooltip(s_score_digits_offset_x_dsc);
 	ImGuiSameLine(COLUMN_SIZE);
@@ -1276,7 +1577,7 @@ void Viewer::showBackgroundOptions(){
 	ImGui::PopItemWidth();
 	ImGuiSameLine(COLUMN_SIZE);
 
-	ImGuiPushItemWidth(100);
+	ImGuiPushItemWidth(ITEM_WIDTH);
 	if (ImGui::SliderPercent("Opacity##Background", &_state.background.imageAlpha, 0.0f, 1.0f)) {
 		_state.background.imageAlpha = glm::clamp(_state.background.imageAlpha, 0.0f, 1.0f);
 	}
@@ -1313,7 +1614,7 @@ void Viewer::showBackgroundOptions(){
 	}
 	ImGui::helpTooltip("Remove the background image");
 
-	ImGuiPushItemWidth(100);
+	ImGuiPushItemWidth(ITEM_WIDTH);
 	ImGui::SliderFloat("Scroll X##Background", &_state.background.scrollSpeed[0], -0.25f, 0.25f);
 	ImGui::helpTooltip(s_bg_img_scroll_x_dsc);
 	ImGuiSameLine(COLUMN_SIZE);
@@ -1327,17 +1628,7 @@ void Viewer::showBackgroundOptions(){
 }
 
 void Viewer::showBottomButtons(){
-	if(ImGui::Button("Export...")){
-		ImGui::OpenPopup("Export");
-	}
-	ImGui::helpTooltip("Export video recording");
-
-	if(_recorder.drawGUI(_guiScale)){
-		startRecording();
-	}
-	ImGuiSameLine();
-
-	if (ImGui::Button("Save config...")) {
+	if (gridButton("Save settings...")) {
 		// Read arguments.
 		char* savePath = nullptr;
 		int res = sr_gui_ask_save_file("Create config file", "", "ini", &savePath);
@@ -1348,9 +1639,9 @@ void Viewer::showBottomButtons(){
 		free(savePath);
 	}
 	ImGui::helpTooltip("Save the current settings for all effects");
-	ImGuiSameLine();
+	ImGuiSameLine(COLUMN_SIZE);
 
-	if (ImGui::Button("Load config...")) {
+	if (gridButton("Load settings...")) {
 		// Read arguments.
 		char* outPath = nullptr;
 		int res = sr_gui_ask_load_file("Select config file", "", "ini", &outPath);
@@ -1363,9 +1654,18 @@ void Viewer::showBottomButtons(){
 		free(outPath);
 	}
 	ImGui::helpTooltip("Load effects settings from a configuration file");
-	ImGuiSameLine();
 
-	if (ImGui::Button("Reset##config")) {
+	if(gridButton("Export video...")){
+		ImGui::OpenPopup("Export");
+	}
+	ImGui::helpTooltip("Export video recording");
+
+	if(_recorder.drawGUI(_guiScale)){
+		startRecording();
+	}
+	ImGuiSameLine(COLUMN_SIZE);
+
+	if (gridButton("Reset settings")) {
 		_state.reset();
 		setState(_state);
 	}
@@ -1377,6 +1677,7 @@ void Viewer::showLayers() {
 	ImGui::SetNextWindowPos(ImVec2(screenSize.x * 0.5f, screenSize.y * 0.5f), ImGuiCond_Once, ImVec2(0.5f, 0.5f));
 	
 	if (ImGui::Begin("Layers", &_showLayers)) {
+		ImGui::paperBackground();
 		ImGui::TextDisabled("You can drag and drop layers to reorder them.");
 		for (int i = int(_state.layersMap.size()) - 1; i >= 0; --i) {
 			const int layerId = _state.layersMap[i];
@@ -1424,6 +1725,7 @@ void Viewer::showLayers() {
 
 void Viewer::showDevices(){
 	if(ImGui::BeginPopupModal("Devices", nullptr, ImGuiWindowFlags_AlwaysAutoResize)){
+		ImGui::paperBackground();
 
 		bool starting = false;
 		const ImVec2 buttonSize(_guiScale * (EXPORT_COLUMN_SIZE-20.0f), 0.0f);
@@ -1433,8 +1735,12 @@ void Viewer::showDevices(){
 		ImGuiSameLine();
 
 		if(ImGui::SmallButton("start virtual device")){
-			_scene = std::make_shared<MIDISceneLive>(-1, _verbose);
-			starting = true;
+			try {
+				_scene = std::make_shared<MIDISceneLive>(-1, _verbose);
+				starting = true;
+			} catch(const std::exception & e){
+				std::cerr << "[MIDI] Unable to start virtual device: " << e.what() << std::endl;
+			}
 		}
 		ImGui::helpTooltip("Act as a virtual device (via JACK)\nother MIDI elements can connect to");
 		ImGui::Separator();
@@ -1456,13 +1762,28 @@ void Viewer::showDevices(){
 
 		if(!devices.empty()){
 			ImGuiSameLine(EXPORT_COLUMN_SIZE);
+			// The selection can be stale (failed auto-connect, device unplugged since):
+			// a negative index would silently start a virtual device instead.
+			const bool validPort = _selectedPort >= 0 && _selectedPort < int(devices.size());
+			if(!validPort){
+				ImGui::BeginDisabled();
+			}
 			if(ImGui::Button("Start", buttonSize)){
-				_scene = std::make_shared<MIDISceneLive>(_selectedPort, _verbose);
-				starting = true;
+				try {
+					_scene = std::make_shared<MIDISceneLive>(_selectedPort, _verbose);
+					starting = true;
+				} catch(const std::exception & e){
+					// The device can vanish between the listing and the opening.
+					std::cerr << "[MIDI] Unable to connect to device: " << e.what() << std::endl;
+				}
+			}
+			if(!validPort){
+				ImGui::EndDisabled();
 			}
 		}
 
 		if(starting){
+			_scene->setTranspose(_state.transpose);
 			_timer = 0.0f;
 			_shouldPlay = true;
 			_state.reverseScroll = true;
@@ -1479,6 +1800,7 @@ void Viewer::showDevices(){
 void Viewer::showVisibility(){
 
 	if(ImGui::BeginPopup("Visibility options")){
+		ImGui::paperBackground();
 		bool shouldUpdate = false;
 
 		ImGui::Text("Tracks");
@@ -1522,6 +1844,7 @@ void Viewer::showVisibility(){
 
 void Viewer::showSets(){
 	if(ImGui::BeginPopup("Note sets options")){
+		ImGui::paperBackground();
 		ImGui::Text("Decide how notes should be grouped in multiple sets");
 		ImGui::Text("(to which you can assign different key/effects colors).");
 		ImGui::Text("This can be based on the MIDI channel, the track, the key,");
@@ -1531,24 +1854,24 @@ void Viewer::showSets(){
 		bool shouldUpdate = false;
 		shouldUpdate = ImGui::RadioButton("Channel", (int*)(&_state.setOptions.mode), int(SetMode::CHANNEL)) || shouldUpdate;
 		ImGui::helpTooltip("Assign each channel to a color set");
-		ImGuiSameLine(90);
+		ImGuiSameLine(115);
 		shouldUpdate = ImGui::RadioButton("Track", (int*)(&_state.setOptions.mode), int(SetMode::TRACK)) || shouldUpdate;
 		ImGui::helpTooltip("Assign each track to a color set");
-		ImGuiSameLine(2*90);
+		ImGuiSameLine(2*115);
 		shouldUpdate = ImGui::RadioButton("Key", (int*)(&_state.setOptions.mode), int(SetMode::KEY)) || shouldUpdate;
 		ImGui::helpTooltip("Assign each of the eight keys to a color set");
-		ImGuiSameLine(3*90);
+		ImGuiSameLine(3*115);
 		shouldUpdate = ImGui::RadioButton("Chromatic", (int*)(&_state.setOptions.mode), int(SetMode::CHROMATIC)) || shouldUpdate;
 		ImGui::helpTooltip("Assign each of the twelve keys to a color set");
 
 		shouldUpdate = ImGui::RadioButton("Split", (int*)(&_state.setOptions.mode), int(SetMode::SPLIT)) || shouldUpdate;
 		ImGui::helpTooltip("Assign keys to a color set based on a separating key");
 		ImGuiSameLine();
-		ImGuiPushItemWidth(100);
+		ImGuiPushItemWidth(ITEM_WIDTH);
 		shouldUpdate = ImGui::Combo("##key", &_state.setOptions.key, midiKeysStrings, 128) || shouldUpdate;
 		ImGui::PopItemWidth();
 
-		ImGuiSameLine(2*90);
+		ImGuiSameLine(2*115);
 		shouldUpdate = ImGui::RadioButton("List", (int*)(&_state.setOptions.mode), int(SetMode::LIST)) || shouldUpdate;
 		ImGui::helpTooltip("Assign keys to sets based on a list of keys, sets and timings");
 		ImGuiSameLine();
@@ -1584,6 +1907,7 @@ void Viewer::showSetEditor(){
 	ImGui::SetNextWindowSize({360, 360}, ImGuiCond_FirstUseEver);
 
 	if(ImGui::Begin("Set List Editor", &_showSetListEditor)){
+		ImGui::paperBackground();
 
 		bool refreshSetOptions = false;
 
@@ -1788,6 +2112,7 @@ void Viewer::showParticlesEditor(){
 	ImGui::SetNextWindowSize({360, 360}, ImGuiCond_FirstUseEver);
 
 	if(ImGui::Begin("Particle Images Editor", &_showParticleEditor)){
+		ImGui::paperBackground();
 
 		bool refreshTextures = false;
 
@@ -2024,6 +2349,7 @@ void Viewer::showPedalsEditor(){
 	ImGui::SetNextWindowSize({fixedWidth, fixedHeight}, ImGuiCond_Always);
 
 	if(ImGui::Begin("Pedal Images Editor", &_showPedalsEditor, ImGuiWindowFlags_NoResize)){
+		ImGui::paperBackground();
 
 		bool refreshTextures = false;
 
@@ -2080,7 +2406,7 @@ void Viewer::showPedalsEditor(){
 		ImGui::Separator();
 
 		{
-			ImGuiPushItemWidth(100);
+			ImGuiPushItemWidth(ITEM_WIDTH);
 			if(ImGui::SliderFloat("##OffsetX", &_state.pedals.margin[0], -0.5f, 0.5f, "Horiz.: %.2f")){
 				_state.pedals.margin[0] = glm::clamp(_state.pedals.margin[0], -0.5f, 0.5f);
 			}
@@ -2144,7 +2470,6 @@ void Viewer::applyAllSettings() {
 	// One-shot parameters.
 	// TODO: (MV) just apply when needed?
 	_renderer.setScaleAndMinorWidth(_state.scale, _state.background.minorsWidth);
-	_renderer.setParticlesParameters(_state.particles.speed, _state.particles.expansion);
 	_renderer.setKeyboardSizeAndFadeout(_state.keyboard.size, _state.notes.fadeOut);
 	_renderer.setMinorEdgesAndHeight(_state.keyboard.minorEdges, _state.keyboard.minorHeight);
 	_renderer.setOrientation(_state.horizontalScroll);
@@ -2223,7 +2548,7 @@ void Viewer::keyPressed(int key, int action) {
 	if (action == GLFW_PRESS) {
 		if (key == GLFW_KEY_P) {
 			_shouldPlay = !_shouldPlay;
-			_timerStart = DEBUG_SPEED * float(glfwGetTime()) - _timer;
+			_timerStart = DEBUG_SPEED * glfwGetTime() - _timer;
 			if(!_shouldPlay){
 				if(auto fs = std::dynamic_pointer_cast<MIDISceneFile>(_scene)) fs->silenceAllNotes();
 			}
@@ -2233,6 +2558,18 @@ void Viewer::keyPressed(int key, int action) {
 		}
 		else if (key == GLFW_KEY_I) {
 			_showGUI = !_showGUI;
+		}
+		else if (key == GLFW_KEY_K) {
+			// Recover from stuck live notes without restarting/reconnecting.
+			if(auto ls = std::dynamic_pointer_cast<MIDISceneLive>(_scene)) ls->resetStuckNotes();
+		}
+		else if (key == GLFW_KEY_J) {
+			// YouTube-style seek: jump back 10 seconds (file playback only).
+			seek(-10.0);
+		}
+		else if (key == GLFW_KEY_L) {
+			// YouTube-style seek: jump forward 10 seconds (file playback only).
+			seek(10.0);
 		}
 		else if (key == GLFW_KEY_D) {
 			_showDebug = !_showDebug;
@@ -2245,9 +2582,28 @@ void Viewer::keyPressed(int key, int action) {
 
 void Viewer::reset() {
 	_timer = -_state.prerollTime;
-	_timerStart = DEBUG_SPEED * float(glfwGetTime()) + (_shouldPlay ? _state.prerollTime : 0.0f);
+	_timerStart = DEBUG_SPEED * glfwGetTime() + (_shouldPlay ? _state.prerollTime : 0.0f);
 	_scene->resetParticles();
 	if(auto fs = std::dynamic_pointer_cast<MIDISceneFile>(_scene)) fs->silenceAllNotes();
+}
+
+void Viewer::seek(double deltaSeconds){
+	// Only file playback has a timeline to scrub; live play is ignored.
+	auto fs = std::dynamic_pointer_cast<MIDISceneFile>(_scene);
+	if(!fs){
+		return;
+	}
+	// The song position handed to the scene is scrollSpeed * _timer, so convert the
+	// requested seconds of song time into timer units.
+	const double speed = (std::max)(0.01f, _state.scrollSpeed);
+	const double songPos = speed * _timer;
+	const double newPos = (std::min)((std::max)(songPos + deltaSeconds, 0.0), _scene->duration());
+	_timer = newPos / speed;
+	// Keep the wall clock consistent whether we are playing or paused.
+	_timerStart = DEBUG_SPEED * glfwGetTime() - _timer;
+	// Avoid stuck notes on the external synth and drop stale particles across the jump.
+	fs->silenceAllNotes();
+	_scene->resetParticles();
 }
 
 void Viewer::setState(const State & state){
@@ -2268,6 +2624,7 @@ void Viewer::setState(const State & state){
 
 	// Update split notes.
 	if(_scene){
+		_scene->setTranspose(_state.transpose);
 		_scene->updateSetsAndVisibleNotes(_state.setOptions, _state.filter);
 	}
 	applyAllSettings();
@@ -2312,9 +2669,9 @@ void  Viewer::setGUIScale(float scale){
 	_guiScale = (std::max)(0.25f, scale);
 	ImGui::GetStyle() = ImGuiStyle();
 	ImGui::configureStyle();
-	ImGui::GetIO().FontGlobalScale = _guiScale;
+	// The font atlas is rasterized at a higher density, compensate for it.
+	ImGui::GetIO().FontGlobalScale = _guiScale / ImGui::fontRasterScale();
 	ImGui::GetStyle().ScaleAllSizes(_guiScale);
-	ImGui::GetStyle().FrameRounding = 3 * _guiScale;
 }
 
 
@@ -2322,6 +2679,8 @@ void Viewer::updateConfiguration(Configuration& config){
 	// Reset
 	config.lastMidiPath = "";
 	config.lastMidiDevice = "";
+	// Remembered MIDI output preference (independent of the active scene).
+	config.lastMidiOutput = _midiOutputName;
 	// General settings
 	config.fullscreen = _fullscreen;
 	config.useTransparency = _useTransparency;
@@ -2422,6 +2781,7 @@ bool Viewer::channelColorEdit(const char * name, const char * displayName, Color
 	ImGuiSameLine(); ImGui::Text("%s", displayName);
 
 	if(ImGui::BeginPopup(name)){
+		ImGui::paperBackground();
 		// Do 3 columns of color sinks.
 		bool edit = false;
 		ImGuiPushItemWidth(35);
@@ -2429,7 +2789,7 @@ bool Viewer::channelColorEdit(const char * name, const char * displayName, Color
 			const std::string nameC = "Set " + std::to_string(cid);
 			edit = ImGui::ColorEdit3(nameC.c_str(), &colors[cid][0], ImGuiColorEditFlags_NoInputs) || edit;
 			if(cid % 3 != 2 && cid != colors.size()-1){
-				ImGuiSameLine(75 * (cid%3+1));
+				ImGuiSameLine(100 * (cid%3+1));
 			}
 		}
 		ImGui::PopItemWidth();
@@ -2472,4 +2832,8 @@ void Viewer::ImGuiPushItemWidth(int w){
 
 void Viewer::ImGuiSameLine(int w){
 	ImGui::SameLine(_guiScale * w);
+}
+
+void Viewer::guiSeparatorSpacing(){
+	ImGui::Spacing();
 }

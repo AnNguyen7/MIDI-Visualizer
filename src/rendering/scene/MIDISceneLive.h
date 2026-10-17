@@ -39,9 +39,19 @@ public:
 
 	const std::string& deviceName() const;
 
+	// Force-close every note that is still being recorded. Used to recover from
+	// stuck notes (a note-on whose note-off never arrived) without restarting.
+	void resetStuckNotes();
+
 	static const std::vector<std::string> & availablePorts(bool force = false);
 	
 private:
+
+	/// End the note currently drawn for a physical key (note-off or retrigger).
+	void releaseRawKey(short raw);
+
+	/// Forget which physical key owns a display slot (the slot is being reused).
+	void clearDisplayOwner(short display);
 
 	struct NoteInfos {
 		short note;
@@ -54,10 +64,19 @@ private:
 	};
 
 	std::vector<NoteInfos> _notesInfos;
+	// Note start times in double precision, indexed by ring-buffer slot. The GPU
+	// note only stores a float start (fine for rendering); the lifecycle logic
+	// uses these so onset/end detection stays exact even after long uptime.
+	std::vector<double> _noteStartTimes;
 	std::array<int, 128> _activeIds;
 	std::array<bool, 128> _activeRecording;
-	std::map<float, Pedals> _pedalInfos;
+	// Display slot (transposed pitch) each physical key was drawn on at note-on,
+	// indexed by raw pitch, -1 if none. Note-offs use it so that changing the
+	// transpose while keys are held still ends the right notes.
+	std::array<short, 128> _rawToDisplay;
+	std::map<double, Pedals> _pedalInfos;
 	std::vector<MIDIFrame> _allMessages;
+	bool _historyTrimmed = false; ///< Oldest frames of _allMessages were dropped.
 
 	double _previousTime = 0.0;
 	double _maxTime = 0.0;

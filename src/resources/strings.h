@@ -36,6 +36,9 @@ constexpr const char* s_min_key_dsc 						= "Lowest key to display";
 constexpr const char* s_max_key_key 						= "max-key";
 constexpr const char* s_max_key_dsc 						= "Highest key to display";
 
+constexpr const char* s_transpose_key 						= "transpose";
+constexpr const char* s_transpose_dsc 						= "Shift displayed notes by N semitones (match Pianoteq's transpose)";
+
 constexpr const char* s_smooth_key 							= "smooth";
 constexpr const char* s_smooth_dsc 							= "Apply anti-aliasing to smooth all lines";
 
@@ -142,22 +145,22 @@ constexpr const char* s_flashes_img_columns_key 			= "flashes-img-columns";
 constexpr const char* s_flashes_img_columns_dsc 			= "Number of columns in the flipbook image";
 
 constexpr const char* s_particles_count_key 				= "particles-count";
-constexpr const char* s_particles_count_dsc 				= "Number of particles in each burst";
+constexpr const char* s_particles_count_dsc 				= "Number of particles for each note";
 
 constexpr const char* s_particles_size_key 					= "particles-size";
 constexpr const char* s_particles_size_dsc 					= "Size of the particles";
-
-constexpr const char* s_particles_speed_key 				= "particles-speed";
-constexpr const char* s_particles_speed_dsc 				= "Particles speed";
-
-constexpr const char* s_particles_expansion_key 			= "particles-expansion";
-constexpr const char* s_particles_expansion_dsc 			= "Particles expansion factor";
 
 constexpr const char* s_particles_paths_key 				= "particles-paths";
 constexpr const char* s_particles_paths_dsc 				= "Set of paths (separated by spaces) to black and white images on disk to use as particles";
 
 constexpr const char* s_particles_turbulences_key 			= "particles-turbulences";
-constexpr const char* s_particles_turbulences_dsc 			= "Particles turbulence strength";
+constexpr const char* s_particles_turbulences_dsc 			= "How far the particles swing from side to side";
+
+constexpr const char* s_particles_float_height_key 			= "particles-float-height";
+constexpr const char* s_particles_float_height_dsc 			= "How high the particles rise above the key";
+
+constexpr const char* s_particles_lifetime_key 				= "particles-lifetime";
+constexpr const char* s_particles_lifetime_dsc 				= "Time in seconds from the note until its particles have vanished";
 
 constexpr const char* s_pedal_size_key 						= "pedal-size";
 constexpr const char* s_pedal_size_dsc 						= "Pedals size";

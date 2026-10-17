@@ -91,25 +91,40 @@ void MIDISceneFile::silenceAllNotes(){
 		_lastPedalCC = {-1, -1, -1, -1};
 		return;
 	}
-	// CC 123 (All Notes Off) on every channel, plus explicit note-offs we know are active.
-	for(int i = 0; i < 128; ++i){
-		if(_wasActive[i]){
-			unsigned char off[3] = {0x80, (unsigned char)i, 0};
-			_midiOut->send_message(off, 3);
+	try {
+		// CC 123 (All Notes Off) on every channel, plus explicit note-offs we know are active.
+		for(int i = 0; i < 128; ++i){
+			if(_wasActive[i]){
+				unsigned char off[3] = {0x80, (unsigned char)i, 0};
+				_midiOut->send_message(off, 3);
+			}
 		}
-	}
-	for(int ch = 0; ch < 16; ++ch){
-		unsigned char allOff[3] = {(unsigned char)(0xB0 | ch), 123, 0};
-		_midiOut->send_message(allOff, 3);
-	}
-	// Release all pedals on channel 0 (damper, sostenuto, soft, expression).
-	const unsigned char ccNums[4] = {64, 66, 67, 11};
-	for(int p = 0; p < 4; ++p){
-		unsigned char msg[3] = {0xB0, ccNums[p], 0};
-		_midiOut->send_message(msg, 3);
+		for(int ch = 0; ch < 16; ++ch){
+			unsigned char allOff[3] = {(unsigned char)(0xB0 | ch), 123, 0};
+			_midiOut->send_message(allOff, 3);
+		}
+		// Release all pedals on channel 0 (damper, sostenuto, soft, expression).
+		const unsigned char ccNums[4] = {64, 66, 67, 11};
+		for(int p = 0; p < 4; ++p){
+			unsigned char msg[3] = {0xB0, ccNums[p], 0};
+			_midiOut->send_message(msg, 3);
+		}
+	} catch(const std::exception & e){
+		// The port vanished (synth closed, IAC bus disabled): don't crash on pause/seek/reset.
+		std::cerr << "[MIDI]: send_message failed: " << e.what() << " (disabling output)" << std::endl;
+		_midiOut.reset();
+		_midiOutPortName.clear();
 	}
 	_wasActive.fill(false);
 	_lastPedalCC = {-1, -1, -1, -1};
+}
+
+void MIDISceneFile::setOutputActive(bool active){
+	// Playback just stopped: release everything so that nothing keeps ringing on the synth.
+	if(_outputActive && !active){
+		silenceAllNotes();
+	}
+	_outputActive = active;
 }
 
 MIDISceneFile::MIDISceneFile(const std::string & midiFilePath, const SetOptions & options, const FilterOptions& filter) : MIDIScene() {
@@ -134,9 +149,9 @@ void MIDISceneFile::updateVisibleNotes( const FilterOptions& filter )
 {
 	// Generate note data for rendering.
 	std::vector<MIDINote> notesM;
-	_midiFile.getNotes( notesM, NoteType::MAJOR, filter, 0 );
+	_midiFile.getNotes( notesM, NoteType::MAJOR, filter, 0, _transpose );
 	std::vector<MIDINote> notesm;
-	_midiFile.getNotes( notesm, NoteType::MINOR, filter, 0 );
+	_midiFile.getNotes( notesm, NoteType::MINOR, filter, 0, _transpose );
 
 	// Load notes shared data.
 	const size_t majorCount = notesM.size();
@@ -184,12 +199,24 @@ void MIDISceneFile::updatesActiveNotes(double time, double speed, const FilterOp
 			particle.duration = particle.start = particle.elapsed = 0.0f;
 		}
 	}
-	// Get notes actives.
+	// Get notes actives. The array is indexed by original MIDI pitch and is used
+	// as-is to drive the MIDI output below (so Pianoteq receives original notes).
+	// The on-screen key highlight and particles are shifted by the visual transpose.
 	auto actives = ActiveNotesArray();
 	_midiFile.getNotesActive(actives, time, filter, 0);
 	for(int i = 0; i < 128; ++i){
+		_actives[i] = -1;
+	}
+	for(int i = 0; i < 128; ++i){
 		const auto & note = actives[i];
-		_actives[i] = note.enabled ? note.set : -1;
+		// Keys transposed off the 0-127 range are not drawn (audio is unaffected).
+		const int di = i + _transpose;
+		if(di < 0 || di > 127){
+			continue;
+		}
+		if(note.enabled){
+			_actives[di] = note.set;
+		}
 		// Check if the note was triggered at this frame.
 		if(note.start > _previousTime && note.start <= time){
 			// Find an available particles system and update it with the note parameters.
@@ -197,9 +224,9 @@ void MIDISceneFile::updatesActiveNotes(double time, double speed, const FilterOp
 				if(particle.note < 0){
 					// Update with new note parameter.
 					//const float durationTweak = 3.0f - note.velocity / 127.0f * 2.5f;
-					particle.duration = (std::max)(note.duration*2.0f, note.duration + 1.2f);
+					particle.duration = _particlesDuration;
 					particle.start = note.start;
-					particle.note = i;
+					particle.note = di;
 					particle.set = note.set;
 					particle.elapsed = 0.0f;
 					break;
@@ -210,7 +237,9 @@ void MIDISceneFile::updatesActiveNotes(double time, double speed, const FilterOp
 	// Send MIDI output messages for note transitions (drives Pianoteq or any external sound engine).
 	// IMPORTANT: must read _previousTime BEFORE it gets updated below, so the onset check
 	// can compare note.start against the previous frame's time.
-	if(_midiOut && _midiOut->is_port_open()){
+	// Nothing is sent while paused: the notes under the cursor are still active and
+	// would be struck again right after silenceAllNotes().
+	if(_outputActive && _midiOut && _midiOut->is_port_open()){
 		try {
 			for(int i = 0; i < 128; ++i){
 				const auto & note = actives[i];
@@ -254,7 +283,7 @@ void MIDISceneFile::updatesActiveNotes(double time, double speed, const FilterOp
 	_midiFile.getPedalsActive(_pedals.damper, _pedals.sostenuto, _pedals.soft, _pedals.expression, time, 0);
 
 	// Forward pedal changes as Control Change messages so VSTs respond to sustain/sostenuto/soft.
-	if(_midiOut && _midiOut->is_port_open()){
+	if(_outputActive && _midiOut && _midiOut->is_port_open()){
 		const float vals[4] = {_pedals.damper, _pedals.sostenuto, _pedals.soft, _pedals.expression};
 		const unsigned char ccNums[4] = {64, 66, 67, 11};
 		try {
